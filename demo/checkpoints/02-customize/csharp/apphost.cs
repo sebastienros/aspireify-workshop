@@ -1,8 +1,8 @@
-#:sdk Aspire.AppHost.Sdk@13.5.3
+#:sdk Aspire.AppHost.Sdk@13.6.0
 #:property AspireUseCliBundle=true
-#:package Aspire.Hosting.PostgreSQL@13.5.3
-#:package Aspire.Hosting.Redis@13.5.3
-#:package Aspire.Hosting.JavaScript@13.5.3
+#:package Aspire.Hosting.PostgreSQL@13.6.0
+#:package Aspire.Hosting.Redis@13.6.0
+#:package Aspire.Hosting.JavaScript@13.6.0
 #:project ../../../start/src/BingoBoard.Admin/BingoBoard.Admin.csproj
 #:project ../../../start/src/BingoBoard.MigrationService/BingoBoard.MigrationService.csproj
 
