@@ -9,6 +9,7 @@ start/
 ├── AspireifyBingo.slnx
 ├── Directory.Packages.props
 ├── compose.yaml
+├── scripts/                         # Bash and PowerShell start/check/cleanup helpers
 └── src/
     ├── BingoBoard.Admin/             # Blazor admin portal and SignalR hub
     ├── BingoBoard.Data/              # EF Core model and migrations
@@ -38,6 +39,60 @@ The player frontend proxies `/api/version-info` and `/bingohub` to the admin bac
 - .NET 10 SDK
 - Node.js 24 LTS
 - Podman or Docker with Compose support (note: the below instructions use Podman, but work the same with Docker)
+
+## Scripted startup (without Aspire)
+
+If you prefer not to use a script, follow the [manual startup instructions](#manual-startup-order) instead.
+
+The `scripts` folder provides equivalent Bash and PowerShell helpers. They resolve paths relative to themselves, so they can run from any directory. The examples below start from `demo/start`.
+
+**Bash** (requires Bash, curl, and the prerequisites above):
+
+```bash
+bash scripts/start.sh
+```
+
+**PowerShell 7 or later:**
+
+```powershell
+./scripts/start.ps1
+```
+
+Startup builds the .NET solution, runs `npm ci`, starts PostgreSQL and Redis, waits for them, runs migrations and seeds data, then starts the admin backend and Vite. It uses the same fixed ports and development credentials as the manual instructions below, without Aspire or ServiceDefaults. The frontend URL is supplied through the environment; the scripts do not create or overwrite `.env`. Set `Authentication__AdminPassword` before startup to override the default `admin` password.
+
+Keep the startup terminal open. Once the readiness checks pass, open <http://localhost:5173> and <http://localhost:5039>. Application logs are written to `.script-state/` (ignored by Git). Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to stop the script-owned application processes and containers; database data is preserved. Startup failures also trigger cleanup. Stop any manually started services before using the startup scripts; occupied ports cause startup to fail rather than reuse unrelated services.
+
+In another terminal, check the running application:
+
+```bash
+bash scripts/check.sh
+```
+
+```powershell
+./scripts/check.ps1
+```
+
+The checks report PostgreSQL readiness, Redis PING, migrated/seeded database data, the admin portal/API, the frontend, and its API and SignalR negotiation proxies. They return a nonzero exit status if any check fails. The migration worker is expected to have exited successfully, not remain running. These checks also work after manual startup; the interactive checks below still verify actual board updates and client connections.
+
+After stopping the startup script, stop infrastructure left by a manual or interrupted run:
+
+```bash
+bash scripts/clean.sh
+# Optional destructive reset: remove containers and the persisted database volume.
+bash scripts/clean.sh --reset
+```
+
+```powershell
+./scripts/clean.ps1
+# Optional destructive reset: remove containers and the persisted database volume.
+./scripts/clean.ps1 -Reset
+```
+
+Cleanup targets only this starting application's Compose resources. It does not kill manually started .NET or Node processes, remove dependencies, or change your `.env`.
+
+All helpers automatically select Podman when installed, or Docker if Podman is not installed, and print the selected runtime. If neither is installed, they report an error. An installed runtime that is stopped or lacks Compose support reports an error rather than silently switching runtimes.
+
+To override detection, prefix **each** Bash command with `CONTAINER_RUNTIME=docker` (for example, `CONTAINER_RUNTIME=docker bash scripts/start.sh`), or pass `-Runtime docker` to **each** PowerShell script. Use `podman` instead to explicitly select Podman. Use the same runtime for startup, checks, and cleanup.
 
 ## Manual startup order
 
