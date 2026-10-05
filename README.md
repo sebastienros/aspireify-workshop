@@ -78,7 +78,7 @@ dotnet build demo/start/AspireifyBingo.slnx
 
 cd demo/start/src/bingo-board
 npm ci
-BINGO_ADMIN_URL=http://localhost:5039 npm run build
+npm run build
 ```
 
 Pull the infrastructure images so they are available before the workshop:
