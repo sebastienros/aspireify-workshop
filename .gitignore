@@ -61,6 +61,7 @@ node_modules/
 dist/
 .vite/
 npm-debug.log*
+.script-state/
 
 # Aspire generated output
 .aspire/

@@ -8,6 +8,8 @@ Materials for the Aspireify Your Stack workshop, first given at NDC Oslo 2026.
 - [Day 2 content and exercises](content/day-2.md)
 - [Demo application](demo/README.md)
 
+To run the demo without Aspire, use the [Bash or PowerShell startup, verification, and cleanup scripts](demo/start/README.md#scripted-startup-without-aspire). Manual startup instructions follow in the same README.
+
 ## Prerequisites
 
 Install and verify the following before the workshop:
