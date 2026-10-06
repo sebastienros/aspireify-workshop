@@ -689,6 +689,7 @@ def merged_events(output: Path, home: Path) -> list[dict]:
     shutil.copyfile(sessions[0], output / "persisted-events.jsonl")
     persisted = read_events(sessions[0])
     by_id = {event["id"]: event for event in persisted if event.get("id")}
+    tool_starts = [event for event in persisted if event.get("type") == "tool.execution_start"]
     events, recovered, unavailable = [], [], []
     lines = (output / "events.jsonl").read_text().splitlines()
     for number, line in enumerate(lines, 1):
@@ -703,6 +704,20 @@ def merged_events(output: Path, home: Path) -> list[dict]:
                                  r'(?:,"parentId":(?:"[^"]*"|null))?}$', line)
             typ = re.match(r'^\{"type":"([^"]+)"', line)
             authoritative = by_id.get(envelope[1]) if envelope else None
+            delta = re.match(r'^\{"type":"assistant.tool_call_delta","data":'
+                             r'\{"toolCallId":"([^"\\]+)","toolName":"([^"\\]+)",', line)
+            complete_calls = [event for event in tool_starts
+                              if delta and event.get("data", {}).get("toolCallId") == delta[1] and
+                              event.get("data", {}).get("toolName") == delta[2]]
+            if (delta and envelope and not authoritative and "******" in line and
+                    re.search(r'},"ephemeral":true,"id":"[^"]+","timestamp":', line) and
+                    len(complete_calls) == 1 and complete_calls[0].get("timestamp", "") >= envelope[2]):
+                unavailable.append({
+                    "line": number, "event_id": envelope[1], "type": typ[1],
+                    "stdout_line_sha256": digest(line.encode()), "tool_call_id": delta[1],
+                    "authoritative_execution_event_id": complete_calls[0]["id"],
+                    "reason": "Corrupted ephemeral argument fragment; complete persisted execution arguments retained"})
+                continue
             if (typ and typ[1] == "assistant.reasoning" and envelope and
                     not authoritative and "******" in line):
                 unavailable.append({"line": number, "event_id": envelope[1], "type": typ[1],
@@ -1398,8 +1413,14 @@ def validate_reuse(path: Path, config: dict, plan: list[dict]) -> tuple[tuple, d
     current_constants = {node.targets[0].id: ast.dump(node, include_attributes=False)
                          for node in ast.parse((HERE / "runner.py").read_text()).body
                          if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)}
+    parser_changed = False
+    non_input_functions = {"main", "trial_plan", "paired_summary", "validate_reuse",
+                           "validate_fixture_gates", "merged_events", "replay_candidate",
+                           "run_fixture_probe", "start_raw_background"}
     for node in ast.parse(old).body:
-        if isinstance(node, ast.FunctionDef) and node.name not in ("main", "trial_plan"):
+        if isinstance(node, ast.FunctionDef) and node.name == "merged_events":
+            parser_changed = current_functions.get(node.name) != ast.dump(node, include_attributes=False)
+        if isinstance(node, ast.FunctionDef) and node.name not in non_input_functions:
             if current_functions.get(node.name) != ast.dump(node, include_attributes=False):
                 raise BenchError(f"Reused execution protocol differs in {node.name}")
         elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
@@ -1408,6 +1429,14 @@ def validate_reuse(path: Path, config: dict, plan: list[dict]) -> tuple[tuple, d
     for filename in ("tool-shim.py", "task-prompt.txt"):
         if result["harness_files"].get(filename) != digest((HERE / filename).read_bytes()):
             raise BenchError(f"Reused execution protocol differs in {filename}")
+    if parser_changed:
+        events = merged_events(path.parent, Path(result["scratch_home"]))
+        fidelity = check_isolation(events, result["treatment"], result["trial"], Path(result["workspace"]))
+        if not fidelity["valid"] or summarize(events, read_json(path.parent / "usage.json")) != result["metrics"]:
+            raise BenchError("Reused parser amendment changed fidelity or measured metrics")
+        result = {**result, "parser_reaudit": {
+            "valid": True, "current_runner_sha256": digest((HERE / "runner.py").read_bytes()),
+            "native_usage_unchanged": True, "agent_input_functions_unchanged": True}}
     return key, {**result, "trial": match, "reused_result_path": str(path)}
 
 
@@ -1789,6 +1818,7 @@ def run_fixture_probe(config: dict, output: Path, *, negative: bool,
 
 
 def replay_candidate(config: dict, source_result: Path, output: Path) -> dict:
+    started = time.monotonic()
     original = read_json(external(source_result))
     source = Path(original["workspace"])
     expected = read_json(source_result.parent / "candidate-files.json")
@@ -1870,7 +1900,11 @@ def replay_candidate(config: dict, source_result: Path, output: Path) -> dict:
         report = source_result.parent / "diagnosis.json"
         if not report.exists():
             report = source_result.parent / "stream-recovery/diagnosis.json"
-        shutil.copyfile(report, output / "diagnosis.json")
+        if report.exists():
+            shutil.copyfile(report, output / "diagnosis.json")
+        else:
+            events = merged_events(source_result.parent, Path(original["scratch_home"]))
+            (output / "diagnosis.json").write_text(final_answer(events) or "{}")
         argv = [sys.executable, config["verifier"]["path"], "--workspace", str(workspace),
                 "--variant", trial["variant"], "--frontend-url", runtime["frontend_url"],
                 "--admin-url", runtime["admin_url"], "--diagnosis", str(output / "diagnosis.json"),
@@ -1897,6 +1931,7 @@ def replay_candidate(config: dict, source_result: Path, output: Path) -> dict:
             if result.get("teardown_errors"):
                 result["status"] = "infrastructure_error"
         result["original_candidate_still_unchanged"] = file_manifest(source, ignore=True) == expected
+        result["replay_wall_ms"] = (time.monotonic() - started) * 1000
         write_json(output / "result.json", result)
     return result
 

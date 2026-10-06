@@ -116,6 +116,33 @@ class FixtureTests(unittest.TestCase):
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_redacted_ephemeral_tool_fragment_requires_unique_complete_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, home = root / "output", root / "home"
+            output.mkdir()
+            persisted = home / ".copilot/session-state/one/events.jsonl"
+            persisted.parent.mkdir(parents=True)
+            complete = {"type": "tool.execution_start", "id": "complete",
+                        "timestamp": "2026-10-06T00:00:01Z",
+                        "data": {"toolCallId": "call", "toolName": "bash",
+                                 "arguments": {"command": "fixture-only argument"}}}
+            damaged = ('{"type":"assistant.tool_call_delta","data":{"toolCallId":"call",'
+                       '"toolName":"bash","inputDelta":"******"broken"},'
+                       '"ephemeral":true,"id":"fragment","timestamp":"2026-10-06T00:00:00Z"}')
+            (output / "events.jsonl").write_text(damaged + "\n")
+            persisted.write_text(json.dumps(complete) + "\n")
+            self.assertEqual(r.merged_events(output, home), [complete])
+            proof = r.read_json(output / "event-stream-integrity.json")
+            self.assertEqual(proof["unavailable_optional_events"][0]["authoritative_execution_event_id"],
+                             "complete")
+            for records in ([], [{**complete, "data": {**complete["data"], "toolName": "wrong"}}],
+                            [complete, {**complete, "id": "duplicate"}],
+                            [{**complete, "timestamp": "2026-10-05T00:00:00Z"}]):
+                persisted.write_text("".join(json.dumps(record) + "\n" for record in records))
+                with self.assertRaisesRegex(r.BenchError, "Unrecoverable"):
+                    r.merged_events(output, home)
+
     def test_redacted_stdout_is_recovered_only_from_exact_persisted_envelope(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -440,6 +467,28 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(key[1], "raw")
             self.assertEqual(result["status"], "budget_hit")
             self.assertEqual(result["reused_result_path"], str(path.resolve()))
+
+    def test_parser_only_reuse_requires_current_fidelity_and_identical_metrics(self):
+        code = (r.HERE / "runner.py").read_text().replace(
+            "events, recovered, unavailable = [], [], []",
+            "events, recovered, unavailable = [], [], [None]", 1)
+        for valid, metric, accepted in ((True, 1, True), (False, 1, False), (True, 2, False)):
+            with tempfile.TemporaryDirectory() as directory:
+                path, config, old = self.reusable_fixture(Path(directory), code)
+                result = r.read_json(path)
+                result.update(scratch_home="/captured/home", workspace="/captured/workspace",
+                              treatment={}, metrics={"observed": 1})
+                r.write_json(path, result)
+                with patch.object(r, "execute", return_value=subprocess.CompletedProcess([], 0, old, "")), patch.object(
+                        r, "merged_events", return_value=[]), patch.object(
+                        r, "check_isolation", return_value={"valid": valid}), patch.object(
+                        r, "summarize", return_value={"observed": metric}):
+                    if accepted:
+                        _, reused = r.validate_reuse(path, config, r.trial_plan(config))
+                        self.assertTrue(reused["parser_reaudit"]["agent_input_functions_unchanged"])
+                    else:
+                        with self.assertRaisesRegex(r.BenchError, "fidelity or measured metrics"):
+                            r.validate_reuse(path, config, r.trial_plan(config))
 
     def test_reuse_rejects_changed_budget_or_execution_protocol(self):
         with tempfile.TemporaryDirectory() as directory:

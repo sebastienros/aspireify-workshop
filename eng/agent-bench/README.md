@@ -295,6 +295,17 @@ damaged record contains the redaction marker. `event-stream-integrity.json`
 records hashes, affected lines and authoritative counterparts. Corrupted optional
 reasoning text without a persisted counterpart is explicitly unavailable; native
 usage remains authoritative. Unrecoverable core events invalidate the treatment.
+An ephemeral streamed tool-argument fragment may be unavailable only when the
+unique complete persisted execution event proves the same call ID/name and later
+timestamp. Complete execution arguments, approvals and model records remain strict.
+
+`recover.py --candidate-result ORIGINAL --replay-result UNPAID_REPLAY --output NEW_ARM`
+creates an explicit recovered-result sidecar, never overwriting the original.
+It re-audits fidelity/native usage and requires owned, clean, byte-identical replay
+evidence under the same grader. Original timing fields remain unchanged; replay
+timing and post-teardown grading are labeled separately. Parser-only amendments
+may reuse results only after current fidelity and exact metric re-audit; changes
+to agent input/execution functions, prompt, SDK or shim still reject reuse.
 
 Usage JSON is authoritative. Native input/cache-read/cache-write/output buckets,
 per-model input/output/cache/reasoning values and nanoAIU/API time are retained
