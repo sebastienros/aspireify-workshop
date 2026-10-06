@@ -525,32 +525,29 @@ class ContractTests(SnapshotCase):
                 healthy, healthy.replace(mapping, equivalent).replace(removed, "")))
         self.assertFalse(verify.admin_program_contract(mapping + mapping, equivalent + mapping))
 
-    def test_checked_compose_fallback_preserves_every_other_script_byte(self):
+    def test_script_changes_still_fail_even_when_shared_version_handler_is_equivalent(self):
+        mapping = ('app.MapGet("/api/version-info", (AppVersionInfoProvider versionInfoProvider)'
+                   ' => versionInfoProvider.GetVersionInfo());')
+        equivalent = ('var versionInfoHandler = (AppVersionInfoProvider versionInfoProvider)'
+                      ' => versionInfoProvider.GetVersionInfo();\n'
+                      'app.MapGet("/api/version", versionInfoHandler);\n'
+                      'app.MapGet("/api/version-info", versionInfoHandler);')
+        write(self.baseline / "demo/start/src/BingoBoard.Admin/Program.cs", mapping)
+        write(self.source / "BingoBoard.Admin/Program.cs", equivalent)
         for name in ("common.sh", "common.ps1"):
             original = (REPO / "demo/start/scripts" / name).read_text()
-            candidate = original
-            for old, new in verify.COMPOSE_FALLBACK_REPLACEMENTS[name]:
-                candidate = candidate.replace(old, new)
             write(self.baseline / "demo/start/scripts" / name, original)
-            write(self.source.parent / "scripts" / name, candidate)
+            write(self.source.parent / "scripts" / name, original)
             self.assertEqual(self.check()["status"], "pass")
-            changes = (
-                candidate + "\n# unrelated rewrite\n",
-                candidate.replace("pg_isready", "true"),
-                candidate.replace("/api/version-info", "/api/version"),
-                candidate.replace("--project-directory", "--other-directory"),
-                candidate.replace("docker-compose version >/dev/null", "true")
-                if name == "common.sh" else candidate.replace(
-                    "Invoke-Native $script:ComposeCommand @('version') | Out-Null", "$true | Out-Null"),
-                candidate.replace('[[ "$RUNTIME" == "docker" ]]', "true")
-                if name == "common.sh" else candidate.replace("$Runtime -eq 'docker'", "$true"),
-                candidate.replace('return 1', 'return 0')
-                if name == "common.sh" else candidate.replace(
-                    "throw 'The selected container runtime does not provide Compose.'", "return"),
-            )
-            for changed in changes:
-                with self.subTest(name=name, change=changed[-100:]):
-                    self.assertFalse(verify.script_contract(original, changed, name))
+            changed = (original.replace('    "$RUNTIME" compose version >/dev/null\n',
+                                        '    docker-compose version >/dev/null\n')
+                       if name == "common.sh" else original.replace(
+                           "    Invoke-Native $Runtime @('compose', 'version') | Out-Null\n",
+                           "    Invoke-Native 'docker-compose' @('version') | Out-Null\n"))
+            write(self.source.parent / "scripts" / name, changed)
+            result = self.check()
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["violations"], ["scripts/" + name + " readiness/lifecycle contract changed"])
             write(self.source.parent / "scripts" / name, original)
 
     def test_raw_snapshot_needs_no_apphosts(self):
@@ -618,76 +615,6 @@ class ContractTests(SnapshotCase):
         write(self.baseline / "demo/start/Directory.Packages.props", "<Packages>original</Packages>")
         write(self.source.parent / "Directory.Packages.props", "<Packages>replacement</Packages>")
         self.assertEqual(self.check()["status"], "fail")
-
-
-class ComposeFallbackBehaviorTests(SnapshotCase):
-    def test_checked_fallback_dispatch_and_failures_with_only_stub_executables(self):
-        interpreters = [("common.sh", "/bin/bash")]
-        if shutil.which("pwsh"):
-            interpreters.append(("common.ps1", shutil.which("pwsh")))
-        stub = (
-            '#!/bin/sh\n'
-            'printf "%s\\n" "$0" "$@" >> "$STUB_LOG"\n'
-            'case "$0" in\n'
-            '  *docker-compose) if [ "$1" = version ]; then exit "$STANDALONE_EXIT"; fi;;\n'
-            '  *) if [ "$1" = info ]; then exit "$INFO_EXIT"; fi\n'
-            '     if [ "$1" = compose ] && [ "$2" = version ]; then exit "$PLUGIN_EXIT"; fi;;\n'
-            'esac\n'
-            'exit "$DISPATCH_EXIT"\n'
-        )
-        for name, interpreter in interpreters:
-            original = (REPO / "demo/start/scripts" / name).read_text()
-            fallback = original
-            for old, new in verify.COMPOSE_FALLBACK_REPLACEMENTS[name]:
-                fallback = fallback.replace(old, new)
-            common = write(self.root / "stub snapshot/scripts" / name, fallback)
-            for runtime, plugin, standalone, info, dispatch, available, expected in (
-                    ("docker", 0, 0, 0, 0, True, "plugin"),
-                    ("docker", 1, 0, 0, 0, True, "standalone"),
-                    ("docker", 1, 1, 0, 0, True, "fail"),
-                    ("docker", 1, 0, 0, 0, False, "fail"),
-                    ("podman", 1, 0, 0, 0, True, "fail"),
-                    ("podman", 0, 0, 0, 0, True, "plugin"),
-                    ("docker", 0, 0, 1, 0, True, "fail"),
-                    ("docker", 1, 0, 0, 1, True, "fail")):
-                with tempfile.TemporaryDirectory(dir=self.root) as directory:
-                    bin_dir = Path(directory)
-                    for tool in ("docker", "podman", *(("docker-compose",) if available else ())):
-                        executable = write(bin_dir / tool, stub)
-                        executable.chmod(0o755)
-                    log = bin_dir / "calls.log"
-                    environment = {**os.environ, "PATH": str(bin_dir) + ":/usr/bin:/bin",
-                                   "COMMON": str(common), "CONTAINER_RUNTIME": runtime,
-                                   "STUB_LOG": str(log), "PLUGIN_EXIT": str(plugin),
-                                   "STANDALONE_EXIT": str(standalone), "INFO_EXIT": str(info),
-                                   "DISPATCH_EXIT": str(dispatch)}
-                    if name == "common.sh":
-                        args = [interpreter, "-c",
-                                'set -euo pipefail; source "$COMMON"; initialize_runtime; '
-                                'compose exec -T redis "argument with spaces"']
-                    else:
-                        args = [interpreter, "-NoProfile", "-NonInteractive", "-Command",
-                                "try { . $env:COMMON; $script:Runtime=$env:CONTAINER_RUNTIME; "
-                                "Initialize-Runtime; Invoke-Compose @('exec','-T','redis','argument with spaces') } "
-                                "catch { exit 1 }"]
-                    result = subprocess.run(args, env=environment, capture_output=True, text=True, timeout=15)
-                    calls = log.read_text().splitlines()
-                    with self.subTest(script=name, runtime=runtime, plugin=plugin,
-                                      standalone=standalone, info=info, available=available, dispatch=dispatch):
-                        self.assertEqual(result.returncode == 0, expected != "fail", result.stderr)
-                        if expected == "fail":
-                            if dispatch == 0:
-                                self.assertNotIn("--project-directory", calls)
-                            continue
-                        project = str(common.parent.parent)
-                        forwarded = ["--project-directory", project, "-f", project + "/compose.yaml",
-                                     "exec", "-T", "redis", "argument with spaces"]
-                        self.assertEqual(calls[-len(forwarded):], forwarded)
-                        command_name = str(bin_dir / ("docker-compose" if expected == "standalone" else runtime))
-                        offset = len(forwarded) + (1 if expected == "plugin" else 0)
-                        self.assertEqual(calls[-offset - 1], command_name)
-                        if expected == "plugin":
-                            self.assertEqual(calls[-offset], "compose")
 
 
 class HttpFixture:
@@ -886,7 +813,7 @@ class HttpAndCliTests(SnapshotCase):
                 diagnosis = {"success": False, "status": "fail", "faults": {}}
                 result = verify.build_result("typescript", checks, diagnosis)
                 with self.subTest(runtime=runtime_status, contracts=contract_status):
-                    self.assertEqual(result["oracle_version"], "3")
+                    self.assertEqual(result["oracle_version"], "4")
                     self.assertEqual(result["runtime_workflows_success"], runtime_status == "pass")
                     self.assertEqual(result["contract_preservation_success"], contract_status == "pass")
                     self.assertEqual(result["contract_success"], result["contract_preservation_success"])
