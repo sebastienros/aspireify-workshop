@@ -1524,7 +1524,8 @@ def validate_reuse(path: Path, config: dict, plan: list[dict]) -> tuple[tuple, d
 def paired_summary(plan: list[dict], results: list[dict]) -> dict:
     pairs = []
     fields = ("status", "repair_success", "diagnosis_success", "setup_ms", "warmup_ms",
-              "agent_wall_ms", "verification_ms", "teardown_ms", "trial_id", "workspace")
+              "agent_wall_ms", "verification_ms", "teardown_ms", "trial_id", "workspace",
+              "agent_scope_violation", "post_teardown_verification")
     for model in dict.fromkeys(trial["model"] for trial in plan):
         arms = {}
         for result in results:
@@ -1532,6 +1533,9 @@ def paired_summary(plan: list[dict], results: list[dict]) -> dict:
                 continue
             variant = result["trial"]["variant"]
             arms[variant] = {**{field: result.get(field) for field in fields},
+                            "runtime_workflows_success": result.get(
+                                "runtime_workflows_success",
+                                (result.get("verification") or {}).get("runtime_workflows_success")),
                             "metrics": result.get("metrics"),
                             "isolation": result.get("isolation"),
                             "verification": result.get("verification"),
