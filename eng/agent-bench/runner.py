@@ -226,7 +226,7 @@ def transform_fixture(workspace: Path, variant: str, trial_id: str,
         path = Path(str(path) + ("mts" if variant == "typescript" else "cs"))
         if variant == "typescript":
             substitutions = {
-                ".withDataVolume()": f".withDataVolume('{trial_id}-postgres-data')",
+                ".withDataVolume()": f".withDataVolume({{ name: '{trial_id}-postgres-data' }})",
                 ".addPostgres('postgres')": ".addPostgres('postgres')\n"
                     f"  .withContainerName('{trial_id}-postgres').withImageTag('18')",
                 ".addRedis('cache')": ".addRedis('cache')\n"
@@ -256,20 +256,30 @@ def transform_fixture(workspace: Path, variant: str, trial_id: str,
 
 
 def isolated_environment(home: Path, workspace: Path, trial_id: str) -> dict:
-    home.mkdir(parents=True)
+    home.mkdir(parents=True, exist_ok=True)
     for name in (".copilot", ".config", ".cache", ".local/share", "tmp"):
         (home / name).mkdir(parents=True, exist_ok=True)
     dotnet = Path(shutil.which("dotnet") or "").resolve()
     if not dotnet.is_file():
         raise BenchError("dotnet executable not found")
+    aspire = shutil.which("aspire")
+    if not aspire:
+        raise BenchError("aspire executable not found")
+    native_bin = home / ".aspire/bin"
+    native_bin.mkdir(parents=True, exist_ok=True)
+    # Native script installs prefer their binary's installation prefix over HOME
+    # and ASPIRE_HOME. Copy only executable bytes (no installer sidecar/config).
+    shutil.copy2(Path(aspire).resolve(), native_bin / "aspire")
     # Executable lookup is retained, not personal config, auth files or parent identity.
     env = {
-        "PATH": os.environ["PATH"], "HOME": str(home), "USERPROFILE": str(home),
+        "PATH": str(native_bin) + os.pathsep + os.environ["PATH"],
+        "HOME": str(home), "USERPROFILE": str(home), "ASPIRE_HOME": str(home / ".aspire"),
         "COPILOT_HOME": str(home / ".copilot"), "XDG_CONFIG_HOME": str(home / ".config"),
         "XDG_CACHE_HOME": str(home / ".cache"), "XDG_DATA_HOME": str(home / ".local/share"),
         "XDG_STATE_HOME": str(home / ".local/state"), "TMPDIR": str(home / "tmp"),
         "DOTNET_ROOT": str(dotnet.parent), "DOTNET_CLI_HOME": str(home),
         "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1", "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+        "DOTNET_GENERATE_ASPNET_CERTIFICATE": "false", "DOTNET_NOLOGO": "1",
         "MSBUILDDISABLENODEREUSE": "1", "DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER": "1",
         "UseSharedCompilation": "false",
         "NUGET_PACKAGES": str(home / ".nuget/packages"), "NPM_CONFIG_CACHE": str(home / ".npm"),
@@ -394,7 +404,7 @@ def configure_treatment(workspace: Path, home: Path, env: dict, trial: dict,
     mcp_path = output / "mcp.json"
     if trial["mcp"]:
         write_json(mcp_path, {"mcpServers": {"aspire": {
-            "type": "local", "command": str(Path(shutil.which("aspire")).resolve()),
+            "type": "local", "command": str(Path(shutil.which("aspire", path=env["PATH"])).resolve()),
             "args": ["agent", "mcp", "--non-interactive", "--nologo"],
             "cwd": str(workspace), "tools": ["*"],
         }}})
@@ -427,6 +437,9 @@ def configure_treatment(workspace: Path, home: Path, env: dict, trial: dict,
 
 def init_trial_git(workspace: Path, env: dict) -> str:
     execute(["git", "init", "-q", "--initial-branch=trial"], cwd=workspace, env=env)
+    (workspace / ".git/info").mkdir(exist_ok=True)
+    with (workspace / ".git/info/exclude").open("a") as exclude:
+        exclude.write("\n/demo/start/.script-state\n")
     execute(["git", "add", "."], cwd=workspace, env=env)
     execute(["git", "-c", "user.name=Benchmark fixture",
              "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "Broken fixture"],
@@ -801,6 +814,11 @@ def prewarm(workspace: Path, env: dict, trial: dict, output: Path) -> dict:
             commands.append((["npm", "ci", "--no-audit", "--no-fund"], appdir))
         commands.append((["aspire", "restore", "--apphost", str(apphost(workspace, trial["variant"])),
                           "--non-interactive", "--nologo"], workspace))
+        if trial["variant"] == "typescript":
+            commands.append((["npm", "run", "aspire:build"], appdir))
+        else:
+            commands.append((["dotnet", "build", str(apphost(workspace, trial["variant"])),
+                              "--nologo", "--disable-build-servers"], appdir))
     for index, (command, cwd) in enumerate(commands):
         begin = time.monotonic()
         execute(command, cwd=cwd, env=env, timeout=600, log=output / f"prewarm-{index}.log")
@@ -916,7 +934,10 @@ def collect_runtime(workspace: Path, env: dict, trial: dict, output: Path,
         response = execute(["aspire", "describe", "--apphost", str(host), "--format", "Json",
                             "--non-interactive", "--nologo"],
                            cwd=workspace, env=env, check=False, log=output / "runtime-describe.log")
-        if response.returncode == 0:
+        # Information messages go to stderr even with exit 0 / --format Json.
+        if "No AppHost is currently running" in response.stdout + response.stderr:
+            metadata["apphost_state"] = "not_running"
+        elif response.returncode == 0:
             model = parse_json_output(response.stdout)
             write_json(output / "runtime-describe.json", model)
             metadata["aspire_description"] = model
@@ -1046,7 +1067,8 @@ def run_trial(config: dict, trial: dict, output: Path, *, calibration: bool) -> 
     started = time.monotonic()
     output.mkdir(parents=True)
     trial_id = "ab-" + uuid.uuid4().hex[:12]
-    root = Path(tempfile.mkdtemp(prefix=trial_id + "-")).resolve()
+    # Darwin's default /var/folders path exceeds AF_UNIX's 104-byte path budget.
+    root = Path(tempfile.mkdtemp(prefix=trial_id + "-", dir="/tmp")).resolve()
     workspace, home = root / "workspace", root / "home"
     result = {"schema_version": 1, "trial_id": trial_id, "trial": trial,
               "workspace": str(workspace), "scratch_home": str(home), "calibration": calibration,

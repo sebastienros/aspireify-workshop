@@ -129,6 +129,15 @@ obtained in memory via the existing environment or `gh auth token`, passed only
 to Copilot, and stripped from shell/MCP environments with `--secret-env-vars`.
 It is never placed in argv, source, config or results.
 
+Temporary roots deliberately use short `/tmp` paths: macOS's default
+`/var/folders` location can exceed its 104-byte Unix-domain socket limit. Native
+Aspire script installations derive configuration/cache/log roots from the
+installed binary prefix before consulting HOME. The runner therefore copies
+**only the installed executable bytes**, without its installer sidecar or any
+personal configuration, into scratch `ASPIRE_HOME/bin` and uses that executable
+for both CLI and MCP. SDK first-use certificate generation is disabled; no trust
+or global certificate configuration is performed by the harness.
+
 Current skills are installed with `aspire agent init --skill-locations github`
 and an explicit seven-skill bundle, `--mcp=false`. No personal directories are
 copied. CLI builtin skills are disabled in the **scratch** config so a no-skill

@@ -54,6 +54,8 @@ class FixtureTests(unittest.TestCase):
                 else:
                     self.assertIn("allkeys-lfr", r.apphost(root, variant).read_text())
                     self.assertIn("ab-test-postgres-data", r.apphost(root, variant).read_text())
+                    if variant == "typescript":
+                        self.assertIn(".withDataVolume({ name:", r.apphost(root, variant).read_text())
                 self.assertTrue(changes)
 
     def test_snapshot_hash_is_reproducible(self):
@@ -263,6 +265,17 @@ class ConfigurationTests(unittest.TestCase):
                        "commit", "-q", "-m", "candidate"], cwd=workspace, env=env)
             r.capture_diff(workspace, env, output)
             self.assertIn("+after", (output / "candidate.patch").read_text())
+
+    def test_not_running_aspire_information_on_stderr_is_not_json_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            response = subprocess.CompletedProcess([], 0, "", "No AppHost is currently running")
+            with patch.object(r, "docker_inspect", return_value=None), patch.object(
+                    r, "execute", return_value=response):
+                runtime = r.collect_runtime(root, {}, {"variant": "typescript"}, root, "ab-test", {})
+            self.assertEqual(runtime["apphost_state"], "not_running")
+            self.assertNotIn("frontend_url", runtime)
+            self.assertEqual(runtime["containers"], [])
 
 
 if __name__ == "__main__":
