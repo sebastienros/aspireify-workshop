@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
 import hashlib
 import io
@@ -1031,7 +1032,27 @@ def teardown(workspace: Path, env: dict, trial: dict, output: Path, runtime: dic
 
 
 def trial_plan(config: dict) -> list[dict]:
-    if config.get("trials"):
+    primary = config.get("design") == "paired-primary"
+    if primary:
+        if config.get("trials") or config.get("replicates", 1) != 1:
+            raise BenchError("Primary smoke uses generated matched pairs and exactly one replicate")
+        models = config.get("models", list(MODELS))
+        if len(models) != len(set(models)) or not models or any(model not in MODELS for model in models):
+            raise BenchError("Primary models must be a unique subset of the four authorized IDs")
+        generator = random.Random(config.get("seed", 0))
+        models = list(models)
+        generator.shuffle(models)
+        first_arms = ["raw", "typescript"] * ((len(models) + 1) // 2)
+        first_arms = first_arms[:len(models)]
+        generator.shuffle(first_arms)
+        trials = []
+        for model, first in zip(models, first_arms):
+            for variant in (first, "typescript" if first == "raw" else "raw"):
+                trials.append({"model": model, "variant": variant,
+                               "skills": "none" if variant == "raw" else "current",
+                               "mcp": variant != "raw", "pair_id": model,
+                               "arm": "raw-bare" if variant == "raw" else "typescript-all-tools"})
+    elif config.get("trials"):
         trials = [dict(trial) for trial in config["trials"]]
     else:
         trials = [{"model": model, "variant": variant, "skills": skills, "mcp": mcp}
@@ -1059,8 +1080,106 @@ def trial_plan(config: dict) -> list[dict]:
         raise BenchError("replicates must be a positive integer")
     expanded = [{**trial, "replicate": replicate}
                 for replicate in range(1, replicates + 1) for trial in trials]
-    random.Random(config.get("seed", 0)).shuffle(expanded)
+    if not primary:
+        random.Random(config.get("seed", 0)).shuffle(expanded)
     return expanded
+
+
+def validate_reuse(path: Path, config: dict, plan: list[dict]) -> tuple[tuple, dict]:
+    path = external(path)
+    result = read_json(path)
+    previous = read_json(path.parent.parent / "config.json")
+    trial = result["trial"]
+    key = (trial["model"], trial["variant"], trial["replicate"])
+    match = next((item for item in plan if
+                  (item["model"], item["variant"], item["replicate"]) == key), None)
+    if not match or any(trial.get(field) != match.get(field) for field in
+                        ("skills", "mcp", "reasoning_effort")):
+        raise BenchError(f"Reused trial does not match a planned arm: {path}")
+    for field, default in (("source_commit", SOURCE), ("sdk", "10.0.400"),
+                           ("context", "default"), ("timeout_seconds", 120),
+                           ("seed", 0), ("current_skills", list(SKILLS)),
+                           ("expected_versions", {})):
+        if previous.get(field, default) != config.get(field, default):
+            raise BenchError(f"Reused trial differs in {field}: {path}")
+    if (result.get("calibration") or result.get("status") not in
+            ("repair_pass", "repair_fail", "budget_hit") or
+            not result.get("isolation", {}).get("valid") or
+            not (path.parent / "usage.json").is_file() or
+            not read_json(path.parent / "usage.json") or
+            result.get("teardown_errors") or result.get("capture_error")):
+        raise BenchError(f"Only fidelity-valid, captured, cleaned repair attempts may be reused: {path}")
+    cleanup = read_json(path.parent / "teardown.json")
+    if cleanup.get("errors") or cleanup.get("orphan_processes"):
+        raise BenchError(f"Reused trial has incomplete cleanup: {path}")
+    if result.get("verifier_pin", {}).get("sha256") != config["verifier"]["sha256"]:
+        raise BenchError("Reused trial has a different verifier")
+    if result.get("snapshot", {}).get("commit") != SOURCE or result.get("prompt_sha256") != digest(
+            (HERE / "task-prompt.txt").read_bytes()):
+        raise BenchError("Reused trial has a different source or prompt")
+    if result.get("prewarm", {}).get("startup_state") != "cold-stopped-prewarmed":
+        raise BenchError("Reused trial has a different startup definition")
+    old = execute(["git", "show", result["harness_commit"] + ":eng/agent-bench/runner.py"],
+                  cwd=REPO).stdout
+    if digest(old.encode()) != result["harness_files"]["runner.py"]:
+        raise BenchError("Reused harness code cannot be verified from its commit")
+    current_functions = {node.name: ast.dump(node, include_attributes=False)
+                         for node in ast.parse((HERE / "runner.py").read_text()).body
+                         if isinstance(node, ast.FunctionDef)}
+    current_constants = {node.targets[0].id: ast.dump(node, include_attributes=False)
+                         for node in ast.parse((HERE / "runner.py").read_text()).body
+                         if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)}
+    for node in ast.parse(old).body:
+        if isinstance(node, ast.FunctionDef) and node.name not in ("main", "trial_plan"):
+            if current_functions.get(node.name) != ast.dump(node, include_attributes=False):
+                raise BenchError(f"Reused execution protocol differs in {node.name}")
+        elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            if current_constants.get(node.targets[0].id) != ast.dump(node, include_attributes=False):
+                raise BenchError(f"Reused execution protocol differs in {node.targets[0].id}")
+    for filename in ("tool-shim.py", "task-prompt.txt"):
+        if result["harness_files"].get(filename) != digest((HERE / filename).read_bytes()):
+            raise BenchError(f"Reused execution protocol differs in {filename}")
+    return key, {**result, "trial": match, "reused_result_path": str(path)}
+
+
+def paired_summary(plan: list[dict], results: list[dict]) -> dict:
+    pairs = []
+    fields = ("status", "repair_success", "diagnosis_success", "setup_ms", "warmup_ms",
+              "agent_wall_ms", "verification_ms", "teardown_ms", "trial_id", "workspace")
+    for model in dict.fromkeys(trial["model"] for trial in plan):
+        arms = {}
+        for result in results:
+            if result["trial"]["model"] != model:
+                continue
+            variant = result["trial"]["variant"]
+            arms[variant] = {**{field: result.get(field) for field in fields},
+                            "metrics": result.get("metrics"),
+                            "isolation": result.get("isolation"),
+                            "verification": result.get("verification"),
+                            "toolchain": result.get("toolchain"),
+                            "prewarm": result.get("prewarm"),
+                            "transformations": result.get("transformations"),
+                            "reused_result_path": result.get("reused_result_path")}
+        raw, aspire = arms.get("raw", {}), arms.get("typescript", {})
+        deltas = {}
+        for field in ("agent_wall_ms", "setup_ms", "warmup_ms", "verification_ms"):
+            a, b = raw.get(field), aspire.get(field)
+            deltas[field] = b - a if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
+        for field in ("nano_aiu", "model_calls", "assistant_turns"):
+            a = (raw.get("metrics") or {}).get(field)
+            b = (aspire.get("metrics") or {}).get(field)
+            deltas[field] = b - a if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
+        token_deltas = {}
+        for field in ("input", "output", "cache_read", "cache_write"):
+            a = ((raw.get("metrics") or {}).get("token_buckets") or {}).get(field)
+            b = ((aspire.get("metrics") or {}).get("token_buckets") or {}).get(field)
+            token_deltas[field] = b - a if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
+        pairs.append({"model": model, "arms": arms, "complete": len(arms) == 2,
+                      "typescript_minus_raw": {**deltas, "token_buckets": token_deltas}})
+    return {"design": "paired-primary", "replicates": 1, "pairs": pairs,
+            "inference": "Descriptive n=1 observations only; no confidence, significance, or general efficiency claim.",
+            "timing": "Agent-only deltas exclude setup, dependency prewarm, verification and cleanup.",
+            "token_semantics": "Native buckets are compared separately; no assumed total or cache/reasoning inclusion."}
 
 
 def run_trial(config: dict, trial: dict, output: Path, *, calibration: bool) -> dict:
@@ -1236,6 +1355,10 @@ def main() -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--verifier-commit", help="Export the exact committed grader outside the trial")
+    parser.add_argument("--reuse-result", type=Path, action="append", default=[],
+                        help="Reuse a compatible captured repair result without another paid attempt")
+    parser.add_argument("--stop-file", type=Path,
+                        help="External marker checked only between trials, never interrupting cleanup")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
@@ -1264,20 +1387,64 @@ def main() -> int:
             path = external(Path(verifier["path"]))
             if digest(path.read_bytes()) != verifier["sha256"]:
                 raise BenchError("Verifier content hash mismatch")
-            if len(plan) > 4:
-                raise BenchError("Paid repair execution is smoke-only (at most four trials)")
+            limit = 8 if config.get("design") == "paired-primary" else 4
+            if len(plan) > limit:
+                raise BenchError(f"Paid repair execution is smoke-only (at most {limit} trials)")
+        if args.reuse_result and (args.command != "run" or config.get("design") != "paired-primary"):
+            raise BenchError("Result reuse is available only for matched primary repair pairs")
+        reused = {}
+        for path in args.reuse_result:
+            key, result = validate_reuse(path, config, plan)
+            if key in reused:
+                raise BenchError("Duplicate reused arm")
+            reused[key] = result
+        if reused:
+            reused_models = {key[0] for key in reused}
+            models = sorted(dict.fromkeys(trial["model"] for trial in plan),
+                            key=lambda model: model not in reused_models)
+            ranks = {model: index for index, model in enumerate(models)}
+            plan.sort(key=lambda trial: (
+                ranks[trial["model"]],
+                (trial["model"], trial["variant"], trial["replicate"]) not in reused))
+        stop_file = external(args.stop_file) if args.stop_file else None
         output.mkdir(parents=True, exist_ok=True)
         write_json(output / "config.json", config)
         write_json(output / "plan.json", plan)
+        write_json(output / "arm-manifest.json", {
+            "design": config.get("design", "unpaired-smoke"), "plan": plan,
+            "source_commit": config.get("source_commit", SOURCE),
+            "verifier": config.get("verifier"), "timeout_seconds": config.get("timeout_seconds", 120),
+            "context": config.get("context", "default"), "seed": config.get("seed", 0),
+            "prompt_sha256": digest((HERE / "task-prompt.txt").read_bytes()),
+            "reused": {str(key): result["reused_result_path"] for key, result in reused.items()},
+            "ordering_adjustment": "Already-executed arms and their matched counterparts come first"
+            if reused else None,
+        })
         results = []
         for index, trial in enumerate(plan):
-            result = run_trial(config, trial, output / f"{index + 1:02d}-{trial['model']}",
-                               calibration=args.command == "calibrate")
+            if stop_file and stop_file.exists():
+                write_json(output / "batch-stop.json", {"reason": "external-stop-marker",
+                                                       "completed": len(results), "next_trial": trial})
+                break
+            key = (trial["model"], trial["variant"], trial["replicate"])
+            if key in reused:
+                result = reused[key]
+            else:
+                result = run_trial(config, trial, output / f"{index + 1:02d}-{trial['model']}",
+                                   calibration=args.command == "calibrate")
             results.append(result)
             print(json.dumps({"trial": index + 1, "model": trial["model"], "status": result["status"]}))
             write_json(output / "results.json", results)
+            if config.get("design") == "paired-primary":
+                write_json(output / "paired-results.json", paired_summary(plan, results))
             if result.get("teardown_errors"):
                 print("Teardown failed; refusing to start another trial", file=sys.stderr)
+                break
+            if args.command == "run" and result["status"] in (
+                    "configuration_error", "infrastructure_error", "model_or_authentication_error"):
+                write_json(output / "batch-stop.json", {"reason": result["status"],
+                                                       "completed": len(results), "failed_trial": trial})
+                print("Harness/model failure; refusing another paid trial", file=sys.stderr)
                 break
         return 0 if len(results) == len(plan) and all(
             result["status"] in ("calibration_pass", "repair_pass") for result in results) else 1

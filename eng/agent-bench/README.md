@@ -1,7 +1,8 @@
 # Copilot CLI smoke benchmark
 
-This stdlib Python harness measures bounded agent repair attempts, not an Aspire
-efficiency comparison. It uses Copilot CLI for every vendor and runs trials
+This stdlib Python harness measures bounded agent repair attempts. Its primary
+smoke uses matched raw-bare versus TypeScript-Aspire-all-tools pairs within each
+model, with one attempt per arm. It uses Copilot CLI for every vendor and runs trials
 **sequentially** against the same stopped, prewarmed startup definition.
 
 Source is pinned to broken commit `75f31a8b98bc3903c64f5bdd752927be15e272a2`;
@@ -37,9 +38,14 @@ python3 eng/agent-bench/runner.py calibrate \
 
 # Requires an explicitly supplied, committed verifier. No PR or matrix is opened:
 python3 eng/agent-bench/runner.py run \
-  --config eng/agent-bench/configs/smoke.json \
+  --config eng/agent-bench/configs/primary-pairs.json \
   --verifier-commit 069b1bcd7645e7c7b99a1efdd587106eb3b2f1b6 \
-  --output /absolute/external/results/repair-smoke
+  --output /absolute/external/results/primary-pairs
+
+# Optional: retain a protocol-compatible already-completed arm without paying again:
+# append --reuse-result /absolute/external/previous/01-model/result.json
+# Optional: append --stop-file /absolute/external/stop-after-current
+# Creating that marker finishes the current trial and cleanup, then stops the batch.
 
 # Generate an interleaved full-factorial plan WITHOUT executing it:
 python3 eng/agent-bench/runner.py plan \
@@ -47,19 +53,29 @@ python3 eng/agent-bench/runner.py plan \
 ```
 
 Output directories must be outside the repository and initially empty. Existing
-results are never overwritten. Repair execution is restricted to at most four
-trials; the factorial configuration is planning-only. A spoiled harness trial
+results are never overwritten. Primary repair execution is restricted to eight
+trials (four pairs, no repetitions); legacy unpaired smoke is limited to four.
+The factorial configuration is planning-only. A spoiled harness trial
 must be explicitly rerun into a new directory and labeled as a harness retry;
 never discard the original or manually repair its candidate.
 
-The authorized repair smoke is:
+The primary authorized benchmark is:
 
 | Model | Fixture | Skills | MCP | Effort / context |
 | --- | --- | --- | --- | --- |
-| `gpt-6-luna` | raw | none | off | medium / default |
-| `gpt-6.1-sol` | TypeScript checkpoint 03 | current | on | medium / default |
-| `claude-haiku-4.5` | C# checkpoint 03 | current | on | native / default |
-| `claude-sonnet-5.5` | TypeScript checkpoint 03 | current | on | medium / default |
+| `gpt-6-luna` | raw + TypeScript checkpoint 03 | none / current | off / on | medium / default |
+| `gpt-6.1-sol` | raw + TypeScript checkpoint 03 | none / current | off / on | medium / default |
+| `claude-haiku-4.5` | raw + TypeScript checkpoint 03 | none / current | off / on | native / default |
+| `claude-sonnet-5.5` | raw + TypeScript checkpoint 03 | none / current | off / on | medium / default |
+
+The raw arm has no Aspire skills or MCP. The paired TypeScript arm has the
+current seven-skill bundle, exact-workspace Aspire MCP, and the Aspire CLI.
+Model, effort, context, source faults, frozen prompt, verifier, startup definition,
+image versions and 600-second agent budget are held fixed within each pair.
+Seeded adjacent pairs balance raw-first and TypeScript-first ordering. Reusing
+an already-run arm puts it and its counterpart first, with that ordering deviation
+recorded. C#, skill-size arms and ablations are secondary, not part of this run.
+The old confounded `smoke.json` is retained only for historical reproduction.
 
 **Haiku exception:** Copilot 1.0.92-5 rejects `--reasoning-effort medium` for
 `claude-haiku-4.5` before creating a session or dispatching a paid model call.
@@ -67,8 +83,8 @@ Following the explicit user decision, Haiku omits that flag and records requeste
 policy `native` and actual effort `null` when unavailable. The other models must
 confirm medium in both session and model-call evidence. Keep the rejected
 original configuration as configuration-error calibration evidence, not a
-repair failure. These four trials confound model, fixture and treatment; they
-support capability smoke conclusions only, **no efficiency/statistical claims**.
+repair failure. Paired deltas are descriptive observations at **n=1** per arm:
+no confidence intervals, significance, or general efficiency claims.
 
 ## Configuration and fixture
 
@@ -85,6 +101,15 @@ subdirectories. All input files are hashed and symlinks rejected. Optional
 extra trial labels are preserved. No smaller/bigger variants are synthesized;
 those comparisons and the full matrix remain pending explicit definitions and
 execution authorization.
+
+`"design": "paired-primary"` generates only the matched raw/TypeScript treatments,
+requires one replicate and a unique subset of the four authorized models, and
+permits at most eight paid attempts. It stops before further paid work on
+configuration, infrastructure, model/authentication, or cleanup failures, but
+does not retry genuine unsuccessful repairs or budget hits. Reuse requires matching
+configuration, prompt, source, verifier, recorded execution-function code and tool
+shim, valid treatment evidence, native usage, and completed cleanup. Scheduler-only
+changes do not invalidate otherwise identical prior evidence.
 
 `git archive` exports only `demo/start`, the root ignore rules, and exactly one
 selected `demo/checkpoints/03-observe/<language>` for Aspire arms. The raw arm has
@@ -188,6 +213,11 @@ Each trial saves `result.json`, `configuration.json`, exact `prompt.txt`,
 candidate/untracked manifests, final answer, `diagnosis.json`, trusted external
 runtime metadata, verification output, and cleanup evidence. Batch `config.json`,
 `plan.json` and `results.json` retain the schedule and pinned external grader.
+`arm-manifest.json` pins exact arms, budget, prompt, ordering and reused artifacts.
+Primary `paired-results.json` preserves per-arm grading, full tool/model metrics,
+runtime/prewarm versions and transformations, plus TypeScript-minus-raw timing,
+nanoAIU, call/turn and separate native-token-bucket deltas. Incomplete pairs retain
+null deltas rather than fabricating results.
 Actual CLI runtime entry-point hashes supplement executable/version hashes.
 
 Usage JSON is authoritative. Native input/cache-read/cache-write/output buckets,

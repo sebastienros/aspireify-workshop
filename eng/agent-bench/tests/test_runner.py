@@ -6,6 +6,8 @@ import unittest
 import os
 import subprocess
 import sys
+import contextlib
+import io
 from unittest.mock import patch
 
 
@@ -208,6 +210,125 @@ class MeasurementTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def reusable_fixture(self, root, old_code=None):
+        config = r.load_config(r.HERE / "configs/primary-pairs.json")
+        config["verifier"] = {"sha256": "grader"}
+        trial = next(trial for trial in r.trial_plan(config) if trial["variant"] == "raw")
+        code = old_code or (r.HERE / "runner.py").read_text()
+        result = {"trial": trial, "calibration": False, "status": "budget_hit",
+                  "isolation": {"valid": True}, "teardown_errors": [],
+                  "verifier_pin": config["verifier"], "snapshot": {"commit": r.SOURCE},
+                  "prompt_sha256": r.digest((r.HERE / "task-prompt.txt").read_bytes()),
+                  "prewarm": {"startup_state": "cold-stopped-prewarmed"},
+                  "harness_commit": "fake",
+                  "harness_files": {name: r.digest((r.HERE / name).read_bytes())
+                                    for name in ("tool-shim.py", "task-prompt.txt")}}
+        result["harness_files"]["runner.py"] = r.digest(code.encode())
+        path = root / "batch/01-model/result.json"
+        r.write_json(path, result)
+        r.write_json(path.parent / "usage.json", {"currentModel": trial["model"]})
+        r.write_json(path.parent / "teardown.json", {"errors": [], "orphan_processes": []})
+        r.write_json(path.parent.parent / "config.json", config)
+        return path, config, code
+
+    def test_reuse_accepts_valid_budget_hits_without_rerunning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, config, code = self.reusable_fixture(Path(directory))
+            with patch.object(r, "execute", return_value=subprocess.CompletedProcess([], 0, code, "")):
+                key, result = r.validate_reuse(path, config, r.trial_plan(config))
+            self.assertEqual(key[1], "raw")
+            self.assertEqual(result["status"], "budget_hit")
+            self.assertEqual(result["reused_result_path"], str(path.resolve()))
+
+    def test_reuse_rejects_changed_budget_or_execution_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, config, code = self.reusable_fixture(Path(directory))
+            config["timeout_seconds"] += 1
+            with self.assertRaisesRegex(r.BenchError, "timeout_seconds"):
+                r.validate_reuse(path, config, r.trial_plan(config))
+        with tempfile.TemporaryDirectory() as directory:
+            code = (r.HERE / "runner.py").read_text().replace("budget_hit = False", "budget_hit = True", 1)
+            path, config, code = self.reusable_fixture(Path(directory), code)
+            with patch.object(r, "execute", return_value=subprocess.CompletedProcess([], 0, code, "")):
+                with self.assertRaisesRegex(r.BenchError, "invoke_agent"):
+                    r.validate_reuse(path, config, r.trial_plan(config))
+
+    def test_reuse_rejects_orphans_and_missing_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, config, _ = self.reusable_fixture(Path(directory))
+            r.write_json(path.parent / "teardown.json", {"orphan_processes": [{"pid": 99}]})
+            with self.assertRaisesRegex(r.BenchError, "cleanup"):
+                r.validate_reuse(path, config, r.trial_plan(config))
+            (path.parent / "usage.json").unlink()
+            with self.assertRaisesRegex(r.BenchError, "captured"):
+                r.validate_reuse(path, config, r.trial_plan(config))
+
+    def test_primary_stops_on_marker_or_infrastructure_failure_before_next_trial(self):
+        for mode in ("marker", "infrastructure_error"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                grader = root / "grader.py"
+                grader.write_text("pass\n")
+                config = r.load_config(r.HERE / "configs/primary-pairs.json")
+                config["models"] = ["gpt-6-luna"]
+                config["verifier"] = {"path": str(grader), "sha256": r.digest(grader.read_bytes())}
+                r.write_json(root / "config.json", config)
+                stop = root / "stop"
+                def fake_trial(config, trial, output, *, calibration):
+                    if mode == "marker":
+                        stop.write_text("stop after cleanup")
+                    return {"trial": trial, "status": "repair_pass" if mode == "marker" else mode}
+                argv = ["runner.py", "run", "--config", str(root / "config.json"),
+                        "--output", str(root / "results"), "--stop-file", str(stop)]
+                with patch.object(sys, "argv", argv), patch.object(
+                        r, "run_trial", side_effect=fake_trial) as run, contextlib.redirect_stdout(
+                            io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(r.main(), 1)
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(len(r.read_json(root / "results/results.json")), 1)
+                self.assertTrue((root / "results/batch-stop.json").exists())
+
+    def test_primary_pairs_are_seeded_balanced_and_matched(self):
+        config = r.load_config(r.HERE / "configs/primary-pairs.json")
+        plan = r.trial_plan(config)
+        self.assertEqual(plan, r.trial_plan(config))
+        self.assertEqual(len(plan), 8)
+        self.assertEqual(sum(plan[i]["variant"] == "raw" for i in range(0, 8, 2)), 2)
+        for i in range(0, 8, 2):
+            a, b = plan[i:i + 2]
+            self.assertEqual(a["model"], b["model"])
+            self.assertEqual(a["reasoning_effort"], b["reasoning_effort"])
+            self.assertEqual({a["variant"], b["variant"]}, {"raw", "typescript"})
+            for arm in (a, b):
+                self.assertEqual(arm["mcp"], arm["variant"] == "typescript")
+                self.assertEqual(arm["skills"], "current" if arm["mcp"] else "none")
+
+    def test_primary_rejects_repetitions_and_duplicate_models(self):
+        for extra in ({"replicates": 2}, {"models": ["gpt-6-luna", "gpt-6-luna"]},
+                      {"models": ["unknown"]}, {"trials": [{"model": "gpt-6-luna"}]}):
+            with self.assertRaises(r.BenchError):
+                r.trial_plan({"design": "paired-primary", **extra})
+
+    def test_primary_summary_keeps_native_buckets_and_incomplete_pairs(self):
+        plan = r.trial_plan({"design": "paired-primary", "models": ["gpt-6-luna"]})
+        results = [{"trial": {"model": "gpt-6-luna", "variant": "raw"},
+                    "metrics": {"nano_aiu": 2, "assistant_turns": 4,
+                                "token_buckets": {"input": 5, "cache_read": 20}},
+                    "agent_wall_ms": 10, "status": "budget_hit", "repair_success": False}]
+        incomplete = r.paired_summary(plan, results)["pairs"][0]
+        self.assertFalse(incomplete["complete"])
+        self.assertIsNone(incomplete["typescript_minus_raw"]["agent_wall_ms"])
+        results.append({"trial": {"model": "gpt-6-luna", "variant": "typescript"},
+                        "metrics": {"nano_aiu": 3, "assistant_turns": 6,
+                                    "token_buckets": {"input": 7, "cache_read": 15}},
+                        "agent_wall_ms": 8, "status": "repair_pass", "repair_success": True})
+        pair = r.paired_summary(plan, results)["pairs"][0]
+        self.assertTrue(pair["complete"])
+        self.assertEqual(pair["typescript_minus_raw"]["agent_wall_ms"], -2)
+        self.assertEqual(pair["typescript_minus_raw"]["assistant_turns"], 2)
+        self.assertEqual(pair["typescript_minus_raw"]["token_buckets"]["cache_read"], -5)
+        self.assertIsNone(pair["typescript_minus_raw"]["token_buckets"]["output"])
+
     def test_plan_reproducible_and_factorial_only_planned(self):
         config = {"seed": 7, "replicates": 2, "models": list(r.MODELS)}
         a, b = r.trial_plan(config), r.trial_plan(config)
