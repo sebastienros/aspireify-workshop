@@ -126,7 +126,7 @@ app.MapHub<BingoHub>("/bingohub");
 // Map authentication endpoints
 app.MapAuthenticationEndpoints();
 
-app.MapGet("/api/version-info", (AppVersionInfoProvider versionInfoProvider) => versionInfoProvider.GetVersionInfo());
+app.MapGet("/api/version", (AppVersionInfoProvider versionInfoProvider) => versionInfoProvider.GetVersionInfo());
 
 if (useServiceDefaults)
 {

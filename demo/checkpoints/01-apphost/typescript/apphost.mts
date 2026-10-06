@@ -2,7 +2,8 @@ import { createBuilder } from './.aspire/modules/aspire.mjs';
 
 const builder = await createBuilder();
 
-const cache = await builder.addRedis('cache');
+const cache = await builder.addRedis('cache')
+  .withArgs(['--maxmemory-policy', 'allkeys-lfr']);
 
 const postgres = await builder
   .addPostgres('postgres')

@@ -208,7 +208,7 @@ export class SignalRService {
     }
 
     try {
-      await this.connection.invoke('RequestBingoSet', persistentClientId, userName)
+      await this.connection.invoke('RequestBingoSet', { clientId: persistentClientId, userName })
     } catch (error) {
       console.error('Failed to request bingo set:', error)
       throw error
@@ -224,7 +224,7 @@ export class SignalRService {
     }
 
     try {
-      await this.connection.invoke('RequestExistingBingoSet', persistentClientId, userName)
+      await this.connection.invoke('RequestExistingBingoSet', { clientId: persistentClientId, userName })
     } catch (error) {
       console.error('Failed to request existing bingo set:', error)
       throw error

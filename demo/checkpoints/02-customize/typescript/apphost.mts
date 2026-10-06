@@ -9,7 +9,8 @@ const builder = await createBuilder();
 
 const adminPassword = await builder.addParameter('admin-password', { secret: true });
 
-const cache = await builder.addRedis('cache');
+const cache = await builder.addRedis('cache')
+  .withArgs(['--maxmemory-policy', 'allkeys-lfr']);
 
 const postgres = await builder
   .addPostgres('postgres')

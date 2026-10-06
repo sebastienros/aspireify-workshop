@@ -13,7 +13,8 @@ var builder = DistributedApplication.CreateBuilder(args);
 
 var adminPassword = builder.AddParameter("admin-password", secret: true);
 
-var cache = builder.AddRedis("cache");
+var cache = builder.AddRedis("cache")
+    .WithArgs("--maxmemory-policy", "allkeys-lfr");
 
 var db = builder.AddPostgres("postgres")
     .WithDataVolume()

@@ -22,7 +22,8 @@ var builder = DistributedApplication.CreateBuilder(args);
 builder.AddDockerComposeEnvironment("compose");
 
 var adminPassword = builder.AddParameter("admin-password", secret: true);
-var cache = builder.AddRedis("cache");
+var cache = builder.AddRedis("cache")
+    .WithArgs("--maxmemory-policy", "allkeys-lfr");
 var postgres = builder.AddPostgres("postgres").WithDataVolume();
 var db = postgres.AddDatabase("db");
 

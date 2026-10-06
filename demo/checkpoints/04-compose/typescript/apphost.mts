@@ -5,7 +5,8 @@ const builder = await createBuilder();
 await builder.addDockerComposeEnvironment('compose');
 
 const adminPassword = await builder.addParameter('admin-password', { secret: true });
-const cache = await builder.addRedis('cache');
+const cache = await builder.addRedis('cache')
+  .withArgs(['--maxmemory-policy', 'allkeys-lfr']);
 const postgres = await builder.addPostgres('postgres').withDataVolume();
 const db = await postgres.addDatabase('db');
 
