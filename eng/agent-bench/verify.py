@@ -20,8 +20,24 @@ Trusted harness runtime metadata (not an agent answer):
      "migrations": {"state": "Exited", "exit_code": 0,
                     "log_path": "/external/trial/migrations.log"}}
 
+Runtime traffic also requires trusted ownership evidence:
+    {"ownership": {"validated": true, "run_id": "trial-1", "errors": [],
+      "endpoints": {
+        "admin": {"url": "http://localhost:5000", "port": 5000,
+                  "listener_processes": [{"pid": 123, "started": "start-time"}]},
+        "frontend": {"url": "http://localhost:5173", "port": 5173,
+                     "listener_processes": [{"pid": 124, "started": "start-time"}]}},
+      "containers": {"redis": {"container_id": "<exact ID>"},
+                     "postgres": {"container_id": "<exact ID>"}}}}
+The harness must prove listener PID/start-time ownership and container ownership
+for this run, rejecting pre-existing listeners. The verifier requires complete
+matching records, not merely a boolean; absent/invalid ownership means unknown
+infrastructure and NO runtime traffic (including read-only HTTP/container probes).
+
 Migration logs are optional; inline "logs" is also supported. A completed state
 AND an integer exit code are required. Container IDs must be 12-64 hex digits.
+Authenticated probes read POSTGRES_PASSWORD/REDIS_PASSWORD only inside those
+containers, never from evaluator metadata or host-side command arguments.
 Additional metadata fields are ignored, never copied into the result. Endpoints,
 if supplied, must match CLI endpoints; absent metadata is unknown, not success.
 --baseline is a trusted healthy snapshot with the same selected layout, outside
@@ -176,6 +192,44 @@ def load_metadata(path, workspace, variant, frontend_url, admin_url, apphost=Non
         return metadata, outcome("pass", "External metadata is bound to the selected workspace and variant")
     except (OSError, ValueError, TypeError) as error:
         return {}, outcome("fail", str(error))
+
+
+def check_ownership(metadata, frontend_url, admin_url):
+    try:
+        run_id = metadata.get("run_id")
+        evidence = metadata.get("ownership")
+        if (not isinstance(run_id, str) or not run_id.strip() or not isinstance(evidence, dict)
+                or evidence.get("validated") is not True or evidence.get("run_id") != run_id
+                or evidence.get("errors") != []):
+            raise ValueError("Missing successful exact-run ownership validation")
+        endpoints = evidence.get("endpoints")
+        containers = evidence.get("containers")
+        if not isinstance(endpoints, dict) or not isinstance(containers, dict):
+            raise ValueError("Ownership must identify exact endpoints and containers")
+        for name, url in (("frontend", frontend_url), ("admin", admin_url)):
+            item = endpoints.get(name)
+            if not isinstance(item, dict) or normalized_url(item.get("url")) != url:
+                raise ValueError("Endpoint ownership URL does not match the selected run")
+            parsed = urllib.parse.urlsplit(url)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            if type(item.get("port")) is not int or item["port"] != port:
+                raise ValueError("Endpoint ownership port does not match the selected run")
+            listeners = item.get("listener_processes")
+            if not isinstance(listeners, list) or not listeners:
+                raise ValueError("Endpoint ownership has no listener PID/start-time evidence")
+            for listener in listeners:
+                if (not isinstance(listener, dict) or type(listener.get("pid")) is not int
+                        or listener["pid"] <= 0 or not isinstance(listener.get("started"), str)
+                        or not listener["started"].strip()):
+                    raise ValueError("Endpoint ownership listener evidence is incomplete")
+        for service in ("redis", "postgres"):
+            spec = container_spec(metadata, service)
+            item = containers.get(service)
+            if not isinstance(item, dict) or item.get("container_id") != spec["container_id"]:
+                raise ValueError("Container ownership ID does not match the selected run")
+        return outcome("pass", "Trusted exact-run endpoint listeners and container ownership are bound")
+    except (ValueError, TypeError, ProbeError) as error:
+        return outcome("unknown", "Runtime ownership is not established: " + str(error))
 
 
 SERVICE_ALIASES = {
@@ -470,9 +524,10 @@ def check_version(url, timeout):
 
 
 class ProbeError(Exception):
-    def __init__(self, status, detail):
+    def __init__(self, status, detail, exit_code=None):
         super().__init__(detail)
         self.status = status
+        self.exit_code = exit_code
 
 
 def command(args, timeout, cwd=None):
@@ -487,7 +542,8 @@ def command(args, timeout, cwd=None):
         raise ProbeError("fail", "Unable to execute runtime probe: " + str(error)) from error
     if result.returncode != 0:
         # Do not include arbitrary command output: harness environments may contain secrets.
-        raise ProbeError("fail", "Runtime probe exited with code " + str(result.returncode))
+        raise ProbeError("fail", "Runtime probe exited with code " + str(result.returncode),
+                         exit_code=result.returncode)
     if len(result.stdout) > MAX_BYTES:
         raise ProbeError("fail", "Runtime probe output exceeds the size limit")
     return result.stdout
@@ -526,12 +582,30 @@ def inspect_container(runtime, container_id, timeout):
         raise ProbeError("fail", str(error)) from error
 
 
+AUTH_SCRIPTS = {
+    "redis": 'if [ -n "${REDIS_PASSWORD:-}" ]; then '
+             'export REDISCLI_AUTH="$REDIS_PASSWORD"; fi; exec "$@"',
+    "postgres": 'if [ -n "${POSTGRES_PASSWORD:-}" ]; then '
+                'export PGPASSWORD="$POSTGRES_PASSWORD"; fi; exec "$@"',
+}
+
+
+def authenticated_command(runtime, container_id, service, argv, timeout):
+    # The fixed script runs inside the selected container; SQL/user/database
+    # remain separate argv entries, and secret values never cross the boundary.
+    return command([runtime, "exec", container_id, "sh", "-c", AUTH_SCRIPTS[service],
+                    "bingo-verifier-auth", *argv], timeout)
+
+
 def check_redis(metadata, runtime, timeout, previous=None):
     try:
         spec = container_spec(metadata, "redis")
         container_id = spec["container_id"]
         restarts = inspect_container(runtime, container_id, timeout)
-        ping = command([runtime, "exec", container_id, "redis-cli", "--raw", "PING"], timeout).strip()
+        ping = authenticated_command(runtime, container_id, "redis",
+                                     ["redis-cli", "--raw", "PING"], timeout).strip()
+        if re.search(r"\bNOAUTH\b|\bWRONGPASS\b|AUTH failed", ping, re.I):
+            raise ProbeError("unknown", "Selected Redis authentication evidence is unavailable or rejected")
         if ping != "PONG":
             raise ProbeError("fail", "Selected Redis did not answer PING with PONG")
         if previous is not None and restarts != previous:
@@ -563,10 +637,20 @@ def check_postgres(metadata, runtime, timeout):
                    for value in (database, user)):
             raise ProbeError("fail", "Postgres metadata must name the exact database and user")
         inspect_container(runtime, container_id, timeout)
-        command([runtime, "exec", container_id, "pg_isready", "-U", user, "-d", database], timeout)
-        output = command([runtime, "exec", container_id, "psql", "-X", "-A", "-t",
-                          "-v", "ON_ERROR_STOP=1", "-U", user, "-d", database,
-                          "-c", postgres_sql()], timeout)
+        command([runtime, "exec", container_id, "pg_isready", "-h", "127.0.0.1",
+                 "-U", user, "-d", database], timeout)
+        try:
+            output = authenticated_command(
+                runtime, container_id, "postgres",
+                ["psql", "-w", "-h", "127.0.0.1", "-X", "-A", "-t",
+                 "-v", "ON_ERROR_STOP=1", "-U", user, "-d", database,
+                 "-c", postgres_sql()], timeout)
+        except ProbeError as error:
+            if error.exit_code == 2:
+                raise ProbeError(
+                    "unknown", "Selected Postgres probe cannot authenticate/connect with container-local credentials"
+                ) from error
+            raise
         try:
             data = json.loads(output)
             if (not isinstance(data, dict) or any(type(data.get(key)) is not int
@@ -847,6 +931,12 @@ def verify(args):
         args.runtime_metadata, workspace, args.variant, frontend_url, admin_url, apphost)
     diagnosis = score_diagnosis(args.diagnosis, workspace, source, apphost, args.variant)
     checks["contracts"] = check_contracts(workspace, source, args.variant, apphost, args.baseline)
+    checks["ownership"] = check_ownership(metadata, frontend_url, admin_url)
+    if checks["ownership"]["status"] != "pass":
+        for name in ("postgres", "migrations", "redis", "frontend",
+                     "version_direct", "version_proxy", *PLAYER_CHECKS):
+            checks[name] = outcome("unknown", "No runtime traffic: exact-run ownership is unproved")
+        return build_result(args.variant, checks, diagnosis)
     runtime = args.container_runtime or metadata.get("container_runtime", "podman")
     checks["postgres"] = check_postgres(metadata, runtime, args.timeout)
     checks["migrations"] = check_migrations(metadata, workspace)
@@ -868,7 +958,7 @@ def verify(args):
 
 
 def build_result(variant, checks, diagnosis):
-    required = ("workspace", "runtime_metadata", "contracts", "postgres", "migrations",
+    required = ("workspace", "runtime_metadata", "ownership", "contracts", "postgres", "migrations",
                 "redis", "frontend", "version_direct", "version_proxy", *PLAYER_CHECKS)
     missing = outcome("unknown", "Check could not be performed")
     for name in required:

@@ -21,6 +21,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -118,6 +119,20 @@ class SnapshotCase(unittest.TestCase):
 
     def metadata(self, **extra):
         return {"run_id": "fixture", "workspace": str(self.workspace), "variant": "raw", **extra}
+
+    def owned_metadata(self, frontend, admin=None):
+        admin = admin or frontend
+        endpoints = {}
+        for name, url in (("frontend", frontend), ("admin", admin)):
+            parsed = verify.urllib.parse.urlsplit(url)
+            endpoints[name] = {"url": url, "port": parsed.port or 80,
+                               "listener_processes": [{"pid": 123, "started": "fixture-start"}]}
+        return self.metadata(
+            redis={"container_id": CONTAINER_ID},
+            postgres={"container_id": CONTAINER_ID, "user": "postgres", "database": "bingo"},
+            ownership={"validated": True, "run_id": "fixture", "errors": [], "endpoints": endpoints,
+                       "containers": {service: {"container_id": CONTAINER_ID}
+                                      for service in ("redis", "postgres")}})
 
 
 class DiagnosisTests(SnapshotCase):
@@ -219,6 +234,30 @@ class MetadataAndContainerTests(SnapshotCase):
         self.assertEqual(verify.load_metadata(
             None, self.workspace, "raw", "http://localhost:5001", "http://localhost:5000")[1]["status"], "unknown")
 
+    def test_ownership_requires_complete_exact_trial_evidence_not_a_boolean(self):
+        frontend, admin = "http://localhost:5001", "http://localhost:5000"
+        good = self.owned_metadata(frontend, admin)
+        self.assertEqual(verify.check_ownership(good, frontend, admin)["status"], "pass")
+        broken = []
+        for ownership in (None, {"validated": True},
+                          {**good["ownership"], "run_id": "another-run"},
+                          {**good["ownership"], "errors": ["preexisting listener"]},
+                          {**good["ownership"], "validated": False}):
+            broken.append({**good, "ownership": ownership})
+        for field, value in (("url", "http://localhost:5039"), ("port", 5039),
+                             ("listener_processes", []),
+                             ("listener_processes", [{"pid": 123}]),
+                             ("listener_processes", [{"pid": True, "started": "fixture"}])):
+            metadata = copy.deepcopy(good)
+            metadata["ownership"]["endpoints"]["admin"][field] = value
+            broken.append(metadata)
+        metadata = copy.deepcopy(good)
+        metadata["ownership"]["containers"]["redis"]["container_id"] = "b" * 64
+        broken.append(metadata)
+        for metadata in broken:
+            with self.subTest(metadata=metadata):
+                self.assertEqual(verify.check_ownership(metadata, frontend, admin)["status"], "unknown")
+
     def test_metadata_bound_to_exact_workspace_variant_and_endpoints(self):
         result, check = self.load(self.metadata(frontend_url="http://localhost:5001/"))
         self.assertEqual(check["status"], "pass")
@@ -281,14 +320,56 @@ class MetadataAndContainerTests(SnapshotCase):
             result = verify.check_redis(metadata, "docker", 1, 0)
             self.assertEqual(result["status"], "pass")
             self.assertEqual(call.call_args_list[1].args[0],
-                             ["docker", "exec", CONTAINER_ID, "redis-cli", "--raw", "PING"])
-        for inspect, ping in ((self.inspection(), "NOAUTH\n"),
+                             ["docker", "exec", CONTAINER_ID, "sh", "-c",
+                              verify.AUTH_SCRIPTS["redis"], "bingo-verifier-auth",
+                              "redis-cli", "--raw", "PING"])
+        for inspect, ping in ((self.inspection(), "not-PONG\n"),
                               (self.inspection(RestartCount=1), "PONG\n"),
                               (self.inspection(Id="b" * 64), "PONG\n"),
                               (self.inspection(State={"Running": False}), "PONG\n"),
                               (self.inspection(State={"Running": True, "Health": {"Status": "unhealthy"}}), "PONG\n")):
             with patch.object(verify, "command", side_effect=[inspect, ping]):
                 self.assertEqual(verify.check_redis(metadata, "docker", 1, 0)["status"], "fail")
+
+    def test_redis_missing_or_rejected_authentication_is_unknown(self):
+        for ping in ("NOAUTH Authentication required.\n", "WRONGPASS invalid password\n",
+                     "AUTH failed: WRONGPASS\nPONG\n"):
+            with patch.object(verify, "command", side_effect=[self.inspection(), ping]):
+                result = verify.check_redis({"redis": {"container_id": CONTAINER_ID}}, "docker", 1)
+            self.assertEqual(result["status"], "unknown")
+            self.assertNotIn(ping.strip(), result["detail"])
+
+    def test_postgres_connection_auth_failure_is_unknown_but_schema_failure_is_not(self):
+        metadata = {"postgres": {"container_id": CONTAINER_ID, "user": "postgres", "database": "db"}}
+        for code, expected in ((2, "unknown"), (1, "fail")):
+            with patch.object(verify, "command", side_effect=[
+                    self.inspection(), "ready",
+                    verify.ProbeError("fail", "Runtime probe exited with code " + str(code), exit_code=code)]):
+                self.assertEqual(verify.check_postgres(metadata, "docker", 1)["status"], expected)
+
+    def test_container_local_credentials_are_quoted_and_not_in_host_argv(self):
+        secret = "synthetic ' $(not-executed); $HOME\nvalue"
+        for service, source, destination in (
+                ("redis", "REDIS_PASSWORD", "REDISCLI_AUTH"),
+                ("postgres", "POSTGRES_PASSWORD", "PGPASSWORD")):
+            for value in (secret, ""):
+                environment = {**os.environ, source: value}
+                environment.pop(destination, None)
+                script = ("import os,sys; "
+                          "print(os.environ.get(sys.argv[1], '') == os.environ.get(sys.argv[2], '')); "
+                          "print(sys.argv[3] == \"literal '$() argument\")")
+                argv = [sys.executable, "-c", script, destination, source, "literal '$() argument"]
+
+                def local_container_command(args, timeout):
+                    self.assertEqual(args[:5], ["docker", "exec", CONTAINER_ID, "sh", "-c"])
+                    self.assertNotIn(secret, args)
+                    return subprocess.run(args[3:], env=environment, capture_output=True,
+                                          text=True, timeout=timeout, check=True).stdout
+
+                with self.subTest(service=service, authenticated=bool(value)), \
+                        patch.object(verify, "command", side_effect=local_container_command):
+                    self.assertEqual(verify.authenticated_command(
+                        "docker", CONTAINER_ID, service, argv, 1), "True\nTrue\n")
 
     def test_postgres_schema_and_all_seed_rows_are_verified_live(self):
         metadata = {"postgres": {"container_id": CONTAINER_ID, "user": "postgres", "database": "bingo"}}
@@ -300,6 +381,10 @@ class MetadataAndContainerTests(SnapshotCase):
             self.assertIn('"__EFMigrationsHistory"', sql)
             self.assertIn("'20260206183116_InitialCreate'", sql)
             self.assertTrue(all("'" + seed + "'" in sql for seed in verify.SEED_IDS))
+            argv = call.call_args_list[2].args[0]
+            self.assertEqual(argv[:5], ["docker", "exec", CONTAINER_ID, "sh", "-c"])
+            self.assertEqual(argv[5], verify.AUTH_SCRIPTS["postgres"])
+            self.assertEqual(argv[7:12], ["psql", "-w", "-h", "127.0.0.1", "-X"])
         for key in observed:
             bad = {**observed, key: 0}
             with patch.object(verify, "command", side_effect=[self.inspection(), "ready", json.dumps(bad)]):
@@ -452,7 +537,7 @@ class HttpAndCliTests(SnapshotCase):
             runtime_metadata=None, baseline=str(self.baseline), timeout=0.2,
             container_runtime=None, **extra)
 
-    def test_unreachable_runtime_is_a_failure_not_agent_claim_success(self):
+    def test_missing_ownership_is_unknown_not_agent_claim_success(self):
         # Closing our own allocated listener yields a known unused fixture endpoint.
         with HttpFixture() as url:
             pass
@@ -460,19 +545,49 @@ class HttpAndCliTests(SnapshotCase):
         result = verify.verify(self.args(url))
         self.assertFalse(result["repair_success"])
         self.assertTrue(result["diagnosis_success"])
-        self.assertEqual(result["checks"]["frontend"]["status"], "fail")
+        self.assertEqual(result["checks"]["frontend"]["status"], "unknown")
         self.assertEqual(result["checks"]["redis"]["status"], "unknown")
         self.assertEqual(result["checks"]["signalr_fresh"]["status"], "unknown")
 
+    def test_unowned_stale_endpoint_has_no_network_container_or_signalr_traffic(self):
+        write_json(self.diagnosis_path, self.answer())
+        metadata = self.owned_metadata("http://localhost:5001", "http://localhost:5039")
+        metadata["ownership"]["validated"] = False
+        path = write_json(self.root / "runtime.json", metadata)
+        args = self.args("http://localhost:5001", "http://localhost:5039")
+        args.runtime_metadata = str(path)
+        with patch.object(verify, "http_get") as http, \
+                patch.object(verify, "command") as command, \
+                patch.object(verify, "check_signalr") as signalr:
+            result = verify.verify(args)
+            http.assert_not_called()
+            command.assert_not_called()
+            signalr.assert_not_called()
+        self.assertEqual(result["repair"]["status"], "unknown")
+        self.assertTrue(result["diagnosis_success"])
+
+    def test_owned_but_unreachable_runtime_is_explicitly_failed(self):
+        with HttpFixture() as url:
+            pass
+        write_json(self.diagnosis_path, self.answer())
+        metadata_path = write_json(self.root / "runtime.json", self.owned_metadata(url))
+        args = self.args(url)
+        args.runtime_metadata = str(metadata_path)
+        with patch.object(verify, "check_postgres", return_value=verify.outcome("unknown", "fixture")), \
+                patch.object(verify, "check_redis", return_value=verify.outcome("unknown", "fixture")), \
+                patch.object(verify, "check_signalr", return_value={
+                    name: verify.outcome("fail", "unreachable fixture") for name in verify.PLAYER_CHECKS}):
+            self.assertEqual(verify.verify(args)["checks"]["frontend"]["status"], "fail")
+
     def test_successful_runtime_is_separate_from_malformed_diagnosis(self):
         write_json(self.diagnosis_path, {"claim": "all fixed"})
-        metadata_path = write_json(self.root / "runtime.json", self.metadata())
         passed = verify.outcome("pass", "fixture runtime observation")
         with HttpFixture() as url, patch.object(verify, "check_postgres", return_value=passed), \
                 patch.object(verify, "check_migrations", return_value=passed), \
                 patch.object(verify, "check_redis", return_value={**passed, "restart_count": 0}), \
                 patch.object(verify, "check_signalr", return_value={name: passed for name in verify.PLAYER_CHECKS}):
             args = self.args(url)
+            metadata_path = write_json(self.root / "runtime.json", self.owned_metadata(url))
             args.runtime_metadata = str(metadata_path)
             result = verify.verify(args)
         self.assertTrue(result["repair_success"])
@@ -481,7 +596,14 @@ class HttpAndCliTests(SnapshotCase):
     def test_direct_and_proxy_versions_must_agree(self):
         write_json(self.diagnosis_path, self.answer())
         with HttpFixture() as admin, HttpFixture(version={**VERSION, "dotNetVersion": "different"}) as frontend:
-            result = verify.verify(self.args(frontend, admin))
+            args = self.args(frontend, admin)
+            args.runtime_metadata = str(write_json(
+                self.root / "runtime.json", self.owned_metadata(frontend, admin)))
+            with patch.object(verify, "check_postgres", return_value=verify.outcome("unknown", "fixture")), \
+                    patch.object(verify, "check_redis", return_value=verify.outcome("unknown", "fixture")), \
+                    patch.object(verify, "check_signalr", return_value={
+                        name: verify.outcome("unknown", "fixture") for name in verify.PLAYER_CHECKS}):
+                result = verify.verify(args)
         self.assertEqual(result["checks"]["version_direct"]["status"], "pass")
         self.assertEqual(result["checks"]["version_proxy"]["status"], "fail")
 
@@ -655,13 +777,24 @@ class PlayerRuntimeTests(SnapshotCase):
 @unittest.skipUnless(os.environ.get("BINGO_VERIFY_LIVE") == "1", "Full runtime fixture is opt-in")
 class LiveApplicationTests(unittest.TestCase):
     def test_healthy_application_then_seeded_player_payload(self):
-        for tool in ("docker", "dotnet", "node", "npm", "git"):
+        self.run_application_fixture(authenticated=False)
+
+    def test_authenticated_typescript_snapshot_then_seeded_player_payload(self):
+        # Exercise the selected TS snapshot and Aspire-style password settings
+        # without starting/discovering any existing AppHost or application.
+        self.run_application_fixture(authenticated=True)
+
+    def run_application_fixture(self, authenticated):
+        for tool in ("docker", "dotnet", "node", "npm", "git", "lsof", "ps"):
             self.assertIsNotNone(shutil.which(tool), "Live fixture requires " + tool)
         with tempfile.TemporaryDirectory(prefix="bingo-verifier-live-") as directory:
             root = Path(directory)
             archive = root / "healthy.tar"
             with archive.open("wb") as stream:
-                subprocess.run(["git", "archive", "c902c52", "demo/start"], cwd=REPO,
+                paths = ["demo/start"]
+                if authenticated:
+                    paths.append("demo/checkpoints/03-observe/typescript")
+                subprocess.run(["git", "archive", "c902c52", *paths], cwd=REPO,
                                stdout=stream, check=True, timeout=30)
             workspace = root / "candidate"
             workspace.mkdir()
@@ -686,10 +819,11 @@ class LiveApplicationTests(unittest.TestCase):
                                  (completed.stderr or completed.stdout)[-3000:])
                 return completed.stdout.strip()
 
-            def create_container(image, port, *arguments):
+            def create_container(image, port, *arguments, container_command=(), environment=None):
                 container_id = run(["docker", "run", "--detach", "--label",
                                     "bingo-verifier-fixture=" + str(root),
-                                    "-p", "127.0.0.1::" + str(port), *arguments, image])
+                                    "-p", "127.0.0.1::" + str(port), *arguments, image,
+                                    *container_command], environment=environment)
                 self.assertRegex(container_id, r"^[a-f0-9]{64}$")
                 containers.append(container_id)
                 mapping = json.loads(run(["docker", "inspect", "--type", "container", container_id]))
@@ -721,11 +855,30 @@ class LiveApplicationTests(unittest.TestCase):
                     time.sleep(0.1)
                 self.fail("Fresh fixture HTTP readiness deadline exceeded")
 
+            def listener_evidence(url, process):
+                port = verify.urllib.parse.urlsplit(url).port
+                listeners = run(["lsof", "-nP", "-iTCP:" + str(port), "-sTCP:LISTEN", "-t"])
+                self.assertEqual(set(listeners.splitlines()), {str(process.pid)},
+                                 "Fixture endpoint must belong exclusively to its registered process")
+                started = run(["ps", "-p", str(process.pid), "-o", "lstart="])
+                self.assertTrue(started)
+                return {"url": url, "port": port,
+                        "listener_processes": [{"pid": process.pid, "started": started}]}
+
             try:
+                db_password = "Fixture-" + uuid.uuid4().hex + "'$!"
+                cache_password = "Fixture-" + uuid.uuid4().hex + "'$!"
                 postgres, db_port = create_container(
                     "postgres:18", 5432, "-e", "POSTGRES_DB=bingo",
-                    "-e", "POSTGRES_USER=postgres", "-e", "POSTGRES_PASSWORD=postgres")
-                redis, cache_port = create_container("redis:8", 6379)
+                    "-e", "POSTGRES_USER=postgres", "-e", "POSTGRES_PASSWORD",
+                    environment={**env, "POSTGRES_PASSWORD": db_password})
+                if authenticated:
+                    redis, cache_port = create_container(
+                        "redis:8", 6379, "-e", "REDIS_PASSWORD",
+                        environment={**env, "REDIS_PASSWORD": cache_password},
+                        container_command=["sh", "-c", 'exec redis-server --requirepass "$REDIS_PASSWORD"'])
+                else:
+                    redis, cache_port = create_container("redis:8", 6379)
                 deadline = time.monotonic() + 30
                 while time.monotonic() < deadline:
                     ready = subprocess.run(
@@ -741,8 +894,9 @@ class LiveApplicationTests(unittest.TestCase):
                     timeout=240, cwd=start)
                 app_env = {**env, "ConnectionStrings__db":
                            "Host=127.0.0.1;Port=" + db_port +
-                           ";Database=bingo;Username=postgres;Password=postgres",
-                           "ConnectionStrings__cache": "127.0.0.1:" + cache_port,
+                           ";Database=bingo;Username=postgres;Password=\"" + db_password + "\"",
+                           "ConnectionStrings__cache": "127.0.0.1:" + cache_port +
+                           (",password=" + cache_password if authenticated else ""),
                            "Authentication__AdminPassword": "Fixture-" + uuid.uuid4().hex + "!1",
                            "ASPNETCORE_ENVIRONMENT": "Development"}
                 migration_dll = source / "BingoBoard.MigrationService/bin/Debug/net10.0/BingoBoard.MigrationService.dll"
@@ -765,17 +919,28 @@ class LiveApplicationTests(unittest.TestCase):
                                   "--port", frontend_url.rsplit(":", 1)[1]],
                                  player, {**env, "BINGO_ADMIN_URL": admin_url}, "frontend")
                 wait_http(frontend_url + "/", frontend)
+                variant = "typescript" if authenticated else "raw"
+                apphost = (workspace / "demo/checkpoints/03-observe/typescript/apphost.mts"
+                           if authenticated else None)
                 metadata_path = write_json(root / "runtime.json", {
-                    "run_id": root.name, "workspace": str(workspace), "variant": "raw",
+                    "run_id": root.name, "workspace": str(workspace), "variant": variant,
                     "container_runtime": "docker", "frontend_url": frontend_url, "admin_url": admin_url,
                     "redis": {"container_id": redis},
                     "postgres": {"container_id": postgres, "database": "bingo", "user": "postgres"},
                     "migrations": {"state": "Exited", "exit_code": migration.returncode,
                                    "log_path": str(root / "migration.log")},
+                    "ownership": {
+                        "validated": True, "run_id": root.name, "errors": [],
+                        "endpoints": {"admin": listener_evidence(admin_url, admin),
+                                      "frontend": listener_evidence(frontend_url, frontend)},
+                        "containers": {"redis": {"container_id": redis},
+                                       "postgres": {"container_id": postgres}},
+                    },
                 })
                 write_json(root / "diagnosis.json", {"diagnoses": []})
                 args = argparse.Namespace(
-                    workspace=str(workspace), variant="raw", apphost=None,
+                    workspace=str(workspace), variant=variant,
+                    apphost=str(apphost) if apphost is not None else None,
                     frontend_url=frontend_url, admin_url=admin_url,
                     diagnosis=str(root / "diagnosis.json"), output=str(root / "result.json"),
                     runtime_metadata=str(metadata_path), baseline=str(baseline),
@@ -783,6 +948,9 @@ class LiveApplicationTests(unittest.TestCase):
                 result = verify.verify(args)
                 self.assertTrue(result["repair_success"], json.dumps(result["checks"], indent=2))
                 self.assertFalse(result["diagnosis_success"])
+                for password in (db_password, cache_password):
+                    self.assertNotIn(password, json.dumps(result))
+                    self.assertNotIn(password, metadata_path.read_text())
                 candidate_service = player / "services/signalrService.js"
                 candidate_service.write_text(candidate_service.read_text().replace(
                     "persistentClientId, userName)", "{ clientId: persistentClientId, userName })"))
