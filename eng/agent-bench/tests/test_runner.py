@@ -609,6 +609,9 @@ class ConfigurationTests(unittest.TestCase):
         incomplete = r.paired_summary(plan, results)["pairs"][0]
         self.assertFalse(incomplete["complete"])
         self.assertIsNone(incomplete["typescript_minus_raw"]["agent_wall_ms"])
+        self.assertEqual(incomplete["arms"]["raw"]["usage_columns"]["uncached_input_tokens"], 5)
+        self.assertEqual(incomplete["arms"]["raw"]["usage_columns"]["ai_credits"], 0.000000002)
+        self.assertIsNone(incomplete["typescript_minus_raw"]["usage_columns"]["ai_credits"])
         results.append({"trial": {"model": "gpt-6-luna", "variant": "typescript"},
                         "metrics": {"nano_aiu": 3, "assistant_turns": 6,
                                     "token_buckets": {"input": 7, "cache_read": 15}},
@@ -619,6 +622,8 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(pair["typescript_minus_raw"]["assistant_turns"], 2)
         self.assertEqual(pair["typescript_minus_raw"]["token_buckets"]["cache_read"], -5)
         self.assertIsNone(pair["typescript_minus_raw"]["token_buckets"]["output"])
+        self.assertEqual(pair["typescript_minus_raw"]["usage_columns"]["uncached_input_tokens"], 2)
+        self.assertIsNone(pair["typescript_minus_raw"]["usage_columns"]["recorded_input_output_tokens"])
 
     def test_plan_reproducible_and_factorial_only_planned(self):
         config = {"seed": 7, "replicates": 2, "models": list(r.MODELS)}

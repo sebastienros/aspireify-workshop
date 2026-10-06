@@ -8,6 +8,7 @@ import ast
 import contextlib
 import datetime as dt
 import hashlib
+import importlib.util
 import io
 import itertools
 import json
@@ -1528,6 +1529,9 @@ def validate_reuse(path: Path, config: dict, plan: list[dict]) -> tuple[tuple, d
 
 
 def paired_summary(plan: list[dict], results: list[dict]) -> dict:
+    spec = importlib.util.spec_from_file_location("bench_report", HERE / "report.py")
+    report = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(report)
     pairs = []
     fields = ("status", "repair_success", "diagnosis_success", "setup_ms", "warmup_ms",
               "agent_wall_ms", "verification_ms", "teardown_ms", "trial_id", "workspace",
@@ -1543,6 +1547,7 @@ def paired_summary(plan: list[dict], results: list[dict]) -> dict:
                                 "runtime_workflows_success",
                                 (result.get("verification") or {}).get("runtime_workflows_success")),
                             "metrics": result.get("metrics"),
+                            "usage_columns": report.usage_from_metrics(result.get("metrics") or {}),
                             "isolation": result.get("isolation"),
                             "verification": result.get("verification"),
                             "toolchain": result.get("toolchain"),
@@ -1563,12 +1568,18 @@ def paired_summary(plan: list[dict], results: list[dict]) -> dict:
             a = ((raw.get("metrics") or {}).get("token_buckets") or {}).get(field)
             b = ((aspire.get("metrics") or {}).get("token_buckets") or {}).get(field)
             token_deltas[field] = b - a if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
+        usage_deltas = {}
+        for field in report.USAGE_COLUMNS[:-1]:
+            a = (raw.get("usage_columns") or {}).get(field)
+            b = (aspire.get("usage_columns") or {}).get(field)
+            usage_deltas[field] = b - a if a is not None and b is not None else None
         pairs.append({"model": model, "arms": arms, "complete": len(arms) == 2,
-                      "typescript_minus_raw": {**deltas, "token_buckets": token_deltas}})
+                      "typescript_minus_raw": {**deltas, "token_buckets": token_deltas,
+                                               "usage_columns": usage_deltas}})
     return {"design": "paired-primary", "replicates": 1, "pairs": pairs,
             "inference": "Descriptive n=1 observations only; no confidence, significance, or general efficiency claim.",
             "timing": "Agent-only deltas exclude setup, dependency prewarm, verification and cleanup.",
-            "token_semantics": "Native buckets are compared separately; no assumed total or cache/reasoning inclusion."}
+            "token_semantics": report.TOKEN_SEMANTICS}
 
 
 def run_trial(config: dict, trial: dict, output: Path, *, calibration: bool) -> dict:

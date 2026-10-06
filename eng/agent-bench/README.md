@@ -336,6 +336,38 @@ ordered classified tools, and successful first runtime-evidence/edit latencies
 are recorded where observable. Classifications are conservative heuristics;
 there is no tokenizer estimate for tool-output tokens.
 
+### Token buckets and AI Credits in final tables
+
+Derived reporting makes cache-read, cache-write, uncached-input and output tokens
+explicit per arm. **Non-cached input+output** means uncached-input + output;
+cache-write remains its own input bucket, not part of that subtotal or cache-read.
+**Recorded input+output** means native `inputTokens` + output, after checking that
+native `inputTokens` equals uncached-input + cache-read + cache-write. The eight
+historical primary records satisfy that identity. Reasoning is retained separately,
+never added again, and missing counts remain null. **AI Credits** are exactly native
+nanoAIU / 1,000,000,000; this is not a flat billed-token-rate calculation.
+
+Fresh batch `paired-results.json` includes these additive `usage_columns` and
+per-pair deltas without changing the original `metrics` or token buckets. Revise
+an existing final handoff without running models or services:
+
+```bash
+python3 -B eng/agent-bench/report.py \
+  --handoff /absolute/previous/final-handoff \
+  --output /absolute/new/final-handoff-usage-v2 \
+  --reporter-commit "$(git rev-parse HEAD)"
+```
+
+The offline reporter reads the handoff's indexed native usage files (and the
+separately listed pilot usage), verifies bucket/nanoAIU identities, and refuses an
+existing or overlapping output directory. It creates explicit per-arm tables,
+`aggregate.csv`, revised aggregate/pair JSON, separate `excluded-pilots.csv` and
+AI Credit totals. Original handoff/native files, frozen runtime/strict/supplemental
+diagnosis scores and timing/cost remain unchanged; failures and unsafe attempts
+remain in the primary totals. `reporting-provenance.json` records the reporter
+version/commit/SHA and every input hash. This is reporting only, not a scoring
+amendment, candidate inspection, runtime replay or new benchmark dispatch.
+
 The external grader receives exact trial container IDs, worker state/exit
 evidence and selected endpoints. Missing evidence is unknown, not success.
 `repair_success` and `diagnosis_success` are independent: a malformed final JSON
