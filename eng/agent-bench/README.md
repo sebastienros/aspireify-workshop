@@ -273,6 +273,13 @@ PID capture and comparison, including single-digit calendar days. Unpaid raw
 startup preserves the foreground script's behavior and waits for its built-in
 ready marker with an event selector; it does not mistake a long-lived script for
 a setup timeout.
+If an agent overrides the assigned Compose project, grading remains blocked.
+Supplemental cleanup considers only exact-workspace/config-file labels, absent
+pre-trial container IDs, post-snapshot creation times and allocated service ports.
+Volumes/networks additionally require fresh creation and bound mount/endpoint
+ownership. It removes only enumerated IDs/names, never broadly downs the changed
+project. Such an agent scope violation stays a failed/unsafe primary attempt with
+full incurred time/cost and unknown runtime verification, not excluded infrastructure.
 
 ## Results and grading
 

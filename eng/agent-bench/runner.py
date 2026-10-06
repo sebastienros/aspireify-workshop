@@ -1178,6 +1178,7 @@ def collect_runtime(workspace: Path, env: dict, trial: dict, output: Path,
                     trial_id: str, ports: dict) -> dict:
     metadata = {"run_id": trial_id, "workspace": str(workspace.resolve()),
                 "variant": trial["variant"], "container_runtime": "docker",
+                "ports": ports,
                 "compose_project": trial_id, "containers": [], "volumes": [],
                 "processes": read_json(output / "processes.json") if (output / "processes.json").exists() else []}
     known_pids = {item["pid"] for item in metadata["processes"]}
@@ -1279,6 +1280,74 @@ def capture_diff(workspace: Path, env: dict, output: Path):
                     tar.add(path, arcname=item, recursive=False)
 
 
+def cleanup_raw_scope_drift(workspace: Path, env: dict, output: Path, runtime: dict) -> list:
+    """Clean only fresh exact-workspace resources; never make them valid grading targets."""
+    before_path = output / "preexisting-runtime.json"
+    before = read_json(before_path)
+    cutoff = before_path.stat().st_mtime * 1000
+    directory = str(workspace / "demo/start")
+    expected_ports = {int(key): value for key, value in runtime["ports"].items()}
+    ids = execute(["docker", "ps", "-aq", "--no-trunc", "--filter",
+                   "label=com.docker.compose.project.working_dir=" + directory],
+                  cwd=workspace, env=env).stdout.split()
+    proof, volumes, networks = [], {}, {}
+    for identifier in ids:
+        container = docker_inspect(identifier, workspace, env)
+        if not container:
+            continue
+        labels = container["Config"].get("Labels") or {}
+        project = labels.get("com.docker.compose.project")
+        service = labels.get("com.docker.compose.service")
+        if project == runtime["run_id"]:
+            continue
+        target = 5432 if service == "postgres" else 6379 if service == "redis" else None
+        bindings = container.get("HostConfig", {}).get("PortBindings", {}).get(f"{target}/tcp") or []
+        if (identifier in before["container_ids"] or not project or target is None or
+                labels.get("com.docker.compose.project.working_dir") != directory or
+                labels.get("com.docker.compose.project.config_files") != directory + "/compose.yaml" or
+                timestamp_ms(container["Created"]) < cutoff or
+                not bindings or {int(item["HostPort"]) for item in bindings} != {expected_ports[target]}):
+            raise BenchError("Refused scope-drift cleanup without fresh workspace/port ownership proof",
+                             "infrastructure_error")
+        proof.append({"container_id": identifier, "name": container["Name"], "project": project,
+                      "labels": labels, "created": container["Created"], "preexisting": False})
+        for mount in container.get("Mounts", []):
+            if mount.get("Type") == "volume":
+                value = parse_json_output(execute(["docker", "volume", "inspect", mount["Name"]],
+                                          cwd=workspace, env=env).stdout)[0]
+                if (timestamp_ms(value["CreatedAt"]) < cutoff or
+                        (value.get("Labels") or {}).get("com.docker.compose.project") != project):
+                    raise BenchError("Refused to remove pre-existing or unbound scope-drift volume",
+                                     "infrastructure_error")
+                volumes[mount["Name"]] = value
+        for value in container.get("NetworkSettings", {}).get("Networks", {}).values():
+            identifier = value["NetworkID"]
+            if identifier:
+                networks[identifier] = parse_json_output(execute(
+                    ["docker", "network", "inspect", identifier], cwd=workspace, env=env).stdout)[0]
+    selected = {item["container_id"] for item in proof}
+    for network in networks.values():
+        if (timestamp_ms(network["Created"]) < cutoff or
+                not set(network.get("Containers", {})).issubset(selected)):
+            raise BenchError("Refused to remove scope-drift network with foreign ownership",
+                             "infrastructure_error")
+    evidence = {"scope_violation": bool(proof), "grading_ownership_relaxed": False,
+                "containers": proof, "volumes": volumes, "networks": networks}
+    write_json(output / "scope-drift-cleanup.json", evidence)
+    for item in proof:
+        execute(["docker", "rm", "-f", item["container_id"]], cwd=workspace, env=env)
+    for name in volumes:
+        execute(["docker", "volume", "rm", name], cwd=workspace, env=env)
+    for identifier in networks:
+        execute(["docker", "network", "rm", identifier], cwd=workspace, env=env)
+    remaining = execute(["docker", "ps", "-aq", "--no-trunc", "--filter",
+                         "label=com.docker.compose.project.working_dir=" + directory],
+                        cwd=workspace, env=env).stdout.split()
+    evidence["remaining_exact_workspace_containers"] = remaining
+    write_json(output / "scope-drift-cleanup.json", evidence)
+    return ["Exact-workspace containers remain after scope-drift cleanup"] if remaining else []
+
+
 def teardown(workspace: Path, env: dict, trial: dict, output: Path, runtime: dict) -> list:
     errors = []
     host = apphost(workspace, trial["variant"])
@@ -1305,6 +1374,8 @@ def teardown(workspace: Path, env: dict, trial: dict, output: Path, runtime: dic
         result = execute(["docker", "volume", "rm", name], cwd=workspace, env=env, check=False)
         if result.returncode:
             errors.append(f"Trial volume removal failed: {name}")
+    if trial["variant"] == "raw" and (output / "preexisting-runtime.json").exists():
+        errors.extend(cleanup_raw_scope_drift(workspace, env, output, runtime))
     table = process_table()
     remaining = [record for record in records if record["pid"] in table and
                  table[record["pid"]]["started"] == record["started"]]
@@ -1317,6 +1388,16 @@ def teardown(workspace: Path, env: dict, trial: dict, output: Path, runtime: dic
 
 def trial_plan(config: dict) -> list[dict]:
     primary = config.get("design") == "paired-primary"
+    continuation = config.get("design") == "primary-continuation"
+    if continuation:
+        remaining = config.get("trials", [])
+        expected = {("claude-sonnet-5.5", "typescript"), ("claude-haiku-4.5", "typescript"),
+                    ("claude-haiku-4.5", "raw")}
+        if (len(remaining) != 3 or {(item["model"], item["variant"]) for item in remaining} != expected or
+                config.get("replicates", 1) != 1 or config.get("timeout_seconds") != 600 or
+                any(item["skills"] != ("none" if item["variant"] == "raw" else "current") or
+                    item["mcp"] != (item["variant"] != "raw") for item in remaining)):
+            raise BenchError("Continuation permits only the three untouched primary slots")
     if primary:
         if config.get("trials") or config.get("replicates", 1) != 1:
             raise BenchError("Primary smoke uses generated matched pairs and exactly one replicate")
@@ -1364,7 +1445,7 @@ def trial_plan(config: dict) -> list[dict]:
         raise BenchError("replicates must be a positive integer")
     expanded = [{**trial, "replicate": replicate}
                 for replicate in range(1, replicates + 1) for trial in trials]
-    if not primary:
+    if not primary and not continuation:
         random.Random(config.get("seed", 0)).shuffle(expanded)
     return expanded
 
@@ -1568,6 +1649,7 @@ def run_trial(config: dict, trial: dict, output: Path, *, calibration: bool) -> 
         # the agent's answer by parsing and serializing it on the way through.
         (output / "diagnosis.json").write_text(answer or "{}")
         result["diagnosis_format_error"] = report_error if not calibration else None
+        result["diagnosis_format_valid"] = report_error is None if not calibration else None
         capture_diff(workspace, env, output)
         if agent["budget_hit"]:
             result["status"] = "budget_hit"
@@ -1643,6 +1725,10 @@ def run_trial(config: dict, trial: dict, output: Path, *, calibration: bool) -> 
                 result["teardown_errors"] = terminate_recorded(read_json(output / "processes.json"))
         result["total_wall_ms"] = (time.monotonic() - started) * 1000
         result["teardown_ms"] = (time.monotonic() - teardown_started) * 1000
+        scope = output / "scope-drift-cleanup.json"
+        if scope.exists() and read_json(scope).get("scope_violation"):
+            result.update(agent_scope_violation=True, repair_success=False,
+                          runtime_workflows_success=None, status="agent_scope_violation")
         write_json(output / "result.json", result)
     return result
 
@@ -1984,13 +2070,14 @@ def main() -> int:
             path = external(Path(verifier["path"]))
             if digest(path.read_bytes()) != verifier["sha256"]:
                 raise BenchError("Verifier content hash mismatch")
-            limit = 8 if config.get("design") == "paired-primary" else 4
+            limit = (3 if config.get("design") == "primary-continuation" else
+                     8 if config.get("design") == "paired-primary" else 4)
             if args.command == "run" and len(plan) > limit:
                 raise BenchError(f"Paid repair execution is smoke-only (at most {limit} trials)")
         if args.reuse_result and (args.command != "run" or config.get("design") != "paired-primary"):
             raise BenchError("Result reuse is available only for matched primary repair pairs")
         gates = validate_fixture_gates(args.fixture_gate, config) if (
-            args.command == "run" and config.get("design") == "paired-primary") else []
+            args.command == "run" and config.get("design") in ("paired-primary", "primary-continuation")) else []
         reused = {}
         for path in args.reuse_result:
             key, result = validate_reuse(path, config, plan)
@@ -2048,13 +2135,14 @@ def main() -> int:
             results.append(result)
             print(json.dumps({"trial": index + 1, "model": trial["model"], "status": result["status"]}))
             write_json(output / "results.json", results)
-            if config.get("design") == "paired-primary":
+            if config.get("design") in ("paired-primary", "primary-continuation"):
                 write_json(output / "paired-results.json", paired_summary(plan, results))
             if result.get("teardown_errors"):
                 print("Teardown failed; refusing to start another trial", file=sys.stderr)
                 break
             if args.command == "run" and result["status"] in (
-                    "configuration_error", "infrastructure_error", "model_or_authentication_error"):
+                    "configuration_error", "infrastructure_error", "model_or_authentication_error",
+                    "agent_scope_violation"):
                 write_json(output / "batch-stop.json", {"reason": result["status"],
                                                        "completed": len(results), "failed_trial": trial})
                 print("Harness/model failure; refusing another paid trial", file=sys.stderr)

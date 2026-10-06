@@ -266,6 +266,46 @@ class MeasurementTests(unittest.TestCase):
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_scope_drift_cleanup_requires_fresh_exact_workspace_and_reserved_ports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            before = root / "preexisting-runtime.json"
+            r.write_json(before, {"container_ids": []})
+            os.utime(before, (0, 0))
+            labels = {"com.docker.compose.project": "wrong-project",
+                      "com.docker.compose.service": "postgres",
+                      "com.docker.compose.project.working_dir": str(workspace / "demo/start"),
+                      "com.docker.compose.project.config_files": str(workspace / "demo/start/compose.yaml")}
+            container = {"Config": {"Labels": labels}, "Created": "2026-10-06T00:00:00Z",
+                         "Name": "wrong-project-postgres", "Mounts": [],
+                         "HostConfig": {"PortBindings": {"5432/tcp": [{"HostPort": "25001"}]}}}
+            runtime = {"run_id": "ab-correct", "ports": {5432: 25001, 6379: 25002}}
+            for foreign, mismatch, valid in ((False, False, True), (True, False, False),
+                                             (False, True, False)):
+                r.write_json(before, {"container_ids": ["id"] if foreign else []})
+                os.utime(before, (0, 0))
+                value = {**container, "HostConfig": {"PortBindings": {
+                    "5432/tcp": [{"HostPort": "25003" if mismatch else "25001"}]}}}
+                removed = []
+                def execute(args, **kwargs):
+                    if args[:3] == ["docker", "ps", "-aq"]:
+                        return subprocess.CompletedProcess(args, 0, "" if removed else "id\n", "")
+                    if args[:3] == ["docker", "rm", "-f"]:
+                        removed.append(args[-1])
+                        return subprocess.CompletedProcess(args, 0, "", "")
+                    self.fail("Unexpected cleanup command: " + repr(args))
+                with patch.object(r, "docker_inspect", return_value=value), patch.object(
+                        r, "execute", side_effect=execute):
+                    if valid:
+                        self.assertEqual(r.cleanup_raw_scope_drift(workspace, {}, root, runtime), [])
+                        self.assertEqual(removed, ["id"])
+                        self.assertFalse(r.read_json(root / "scope-drift-cleanup.json")["grading_ownership_relaxed"])
+                    else:
+                        with self.assertRaisesRegex(r.BenchError, "ownership proof"):
+                            r.cleanup_raw_scope_drift(workspace, {}, root, runtime)
+                        self.assertEqual(removed, [])
+
     def test_registered_pid_normalizes_calendar_spacing_without_widening_ownership(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
