@@ -71,7 +71,7 @@ import urllib.parse
 import urllib.request
 
 
-ORACLE_VERSION = "2"
+ORACLE_VERSION = "3"
 FAULTS = ("HEALTH-01", "CONFIG-01", "INTEROP-01", "INTEROP-02")
 SEED_IDS = (
     "free", "council-of-aspirations", "screen-share-fail", "pine-mentioned",
@@ -390,6 +390,21 @@ def admin_program_contract(before, after):
         return [i for i in range(len(tokens) - len(sequence) + 1)
                 if tokens[i:i + len(sequence)] == sequence]
 
+    if len(positions(original, healthy)) != 1 or positions(original, alias):
+        return False
+    declaration = code_tokens(
+        'var versionInfoHandler = (AppVersionInfoProvider versionInfoProvider)'
+        ' => versionInfoProvider.GetVersionInfo();')
+    shared_healthy = code_tokens('app.MapGet("/api/version-info", versionInfoHandler);')
+    shared_alias = code_tokens('app.MapGet("/api/version", versionInfoHandler);')
+    for mappings in (shared_healthy, shared_alias + shared_healthy, shared_healthy + shared_alias):
+        equivalent = declaration + mappings
+        replacements = positions(candidate, equivalent)
+        if len(replacements) == 1 and "versionInfoHandler" not in original:
+            start = replacements[0]
+            if candidate[:start] + healthy + candidate[start + len(equivalent):] == original:
+                return True
+
     healthy_original = positions(original, healthy)
     healthy_candidate = positions(candidate, healthy)
     aliases = positions(candidate, alias)
@@ -454,6 +469,60 @@ def compose_contract(text):
                          line))
 
 
+COMPOSE_FALLBACK_REPLACEMENTS = {
+    "common.sh": (
+        ('RUNTIME="${CONTAINER_RUNTIME:-auto}"\n',
+         'RUNTIME="${CONTAINER_RUNTIME:-auto}"\nCOMPOSE_COMMAND=()\n'),
+        ('    "$RUNTIME" compose version >/dev/null\n',
+         '    if "$RUNTIME" compose version >/dev/null 2>&1; then\n'
+         '        COMPOSE_COMMAND=("$RUNTIME" compose)\n'
+         '    elif [[ "$RUNTIME" == "docker" ]] && command -v docker-compose >/dev/null 2>&1; then\n'
+         '        COMPOSE_COMMAND=(docker-compose)\n'
+         '        docker-compose version >/dev/null\n'
+         '    else\n'
+         '        echo "The selected container runtime does not provide Compose." >&2\n'
+         '        return 1\n'
+         '    fi\n'),
+        ('    "$RUNTIME" compose --project-directory "$START_DIR" -f "$START_DIR/compose.yaml" "$@"\n',
+         '    "${COMPOSE_COMMAND[@]}" --project-directory "$START_DIR" -f "$START_DIR/compose.yaml" "$@"\n'),
+    ),
+    "common.ps1": (
+        ("    Invoke-Native $Runtime @('compose', 'version') | Out-Null\n",
+         "    $script:ComposeCommand = $Runtime\n"
+         "    $script:ComposePrefix = @('compose')\n"
+         "    $composeVersion = & $Runtime compose version 2>$null\n"
+         "    if ($LASTEXITCODE -ne 0) {\n"
+         "        if ($Runtime -eq 'docker' -and (Get-Command docker-compose -ErrorAction SilentlyContinue)) {\n"
+         "            $script:ComposeCommand = 'docker-compose'\n"
+         "            $script:ComposePrefix = @()\n"
+         "            Invoke-Native $script:ComposeCommand @('version') | Out-Null\n"
+         "        }\n"
+         "        else {\n"
+         "            throw 'The selected container runtime does not provide Compose.'\n"
+         "        }\n"
+         "    }\n"),
+        ("    Invoke-Native $Runtime (@('compose', '--project-directory', $StartDirectory, '-f', \"$StartDirectory/compose.yaml\") + $Arguments)\n",
+         "    Invoke-Native $script:ComposeCommand ($script:ComposePrefix + @('--project-directory', $StartDirectory, '-f', \"$StartDirectory/compose.yaml\") + $Arguments)\n"),
+    ),
+}
+
+
+def script_contract(before, after, name):
+    if before == after:
+        return True
+    replacements = COMPOSE_FALLBACK_REPLACEMENTS.get(name)
+    if replacements is None:
+        return False
+    expected = before
+    for old, new in replacements:
+        if expected.count(old) != 1:
+            return False
+        expected = expected.replace(old, new, 1)
+    # This is a complete-file comparison, not a mask of runtime selection.
+    # Readiness, failure propagation, exact project/file scope and argv survive.
+    return expected == after
+
+
 def check_contracts(workspace, source, variant, apphost, baseline):
     if baseline is None:
         return outcome("unknown", "No external healthy baseline; removal of waits/contracts cannot be excluded")
@@ -498,7 +567,8 @@ def check_contracts(workspace, source, variant, apphost, baseline):
                 if original.is_file():
                     candidate = candidate_start / "scripts" / original.name
                     if (not candidate.is_file() or not inside(candidate, workspace)
-                            or candidate.read_bytes() != original.read_bytes()):
+                            or not script_contract(original.read_text(encoding="utf-8"),
+                                                   candidate.read_text(encoding="utf-8"), original.name)):
                         problems.append("scripts/" + original.name + " readiness/lifecycle contract changed")
         if variant == "raw":
             original, candidate = baseline_start / "compose.yaml", candidate_start / "compose.yaml"
