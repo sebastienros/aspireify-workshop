@@ -354,3 +354,27 @@ before startup and after verification. They refuse occupied original ports,
 containers or volumes, never remap or edit source, use fresh storage, and retain
 the original timing/usage references. They report `paid_model_calls: 0` and
 `primary_eligibility: false`; post-teardown evidence is not the original timed run.
+
+## Supplemental diagnosis calibration
+
+The historical smoke's frozen oracle4 used overly broad service grouping and
+required literal details in the cause rather than considering evidence. Its
+all-diagnosis-fail result is not semantically reliable. Oracle5 is a separately
+versioned **post-smoke, diagnosis-only** calibration: canonical source paths and
+semantic root categories, combined cause/evidence, strict singleton cardinality
+and unchanged strict JSON parsing. It does not change runtime, preservation,
+time/cost fields or original manifests, and does not justify a broad "wrong
+diagnosis" claim from oracle4's score.
+
+```bash
+python3 eng/agent-bench/verify.py --diagnosis-only \
+  --workspace /absolute/original/trial/workspace --variant raw \
+  --diagnosis /absolute/original/diagnosis.json \
+  --output /absolute/new/supplemental-diagnosis.json \
+  --oracle-commit 750a170758ded4500836af65a1d0f2ba299ead9b
+```
+
+This mode is offline: it reads only the supplied report, needs no candidate
+files, endpoints or containers, cannot overwrite an output, and records grader
+and input hashes with `runtime_evaluated: false`. Full runtime reproduction
+continues to pin oracle4 explicitly in `run-primary.sh`.
