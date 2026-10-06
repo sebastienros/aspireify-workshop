@@ -1,0 +1,14 @@
+{
+  "source_commit": "75f31a8b98bc3903c64f5bdd752927be15e272a2",
+  "models": ["gpt-6-luna", "gpt-6.1-sol", "claude-haiku-4.5", "claude-sonnet-5.5"],
+  "variants": ["raw", "typescript", "csharp"],
+  "skills": ["none", "current"],
+  "mcp": [false, true],
+  "replicates": 1,
+  "seed": 20261005,
+  "reasoning_effort": "medium",
+  "reasoning_effort_by_model": {"claude-haiku-4.5": "native"},
+  "context": "default",
+  "timeout_seconds": 600,
+  "verifier": null
+}

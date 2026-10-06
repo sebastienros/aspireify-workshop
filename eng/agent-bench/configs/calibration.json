@@ -1,0 +1,24 @@
+{
+  "source_commit": "75f31a8b98bc3903c64f5bdd752927be15e272a2",
+  "sdk": "10.0.400",
+  "reasoning_effort": "medium",
+  "reasoning_effort_by_model": {"claude-haiku-4.5": "native"},
+  "context": "default",
+  "timeout_seconds": 120,
+  "replicates": 1,
+  "seed": 20261005,
+  "expected_versions": {
+    "copilot": "1.0.92-5",
+    "aspire": "13.6.0+56f3e9c0d216c0c7069dabb49dd0464e4827744f",
+    "dotnet": "10.0.400",
+    "node": "v24.4.1",
+    "npm": "11.4.2",
+    "docker": "28.0.4 / 28.0.4"
+  },
+  "trials": [
+    {"model": "gpt-6-luna", "variant": "raw", "skills": "none", "mcp": false},
+    {"model": "gpt-6.1-sol", "variant": "typescript", "skills": "current", "mcp": false},
+    {"model": "claude-haiku-4.5", "variant": "csharp", "skills": "none", "mcp": true},
+    {"model": "claude-sonnet-5.5", "variant": "typescript", "skills": "current", "mcp": true}
+  ]
+}
