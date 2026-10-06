@@ -24,11 +24,16 @@ Runtime traffic also requires trusted ownership evidence:
     {"ownership": {"validated": true, "run_id": "trial-1", "errors": [],
       "endpoints": {
         "admin": {"url": "http://localhost:5000", "port": 5000,
+                  "run_id": "trial-1", "preexisting": false,
                   "listener_processes": [{"pid": 123, "started": "start-time"}]},
         "frontend": {"url": "http://localhost:5173", "port": 5173,
+                     "run_id": "trial-1", "preexisting": false,
                      "listener_processes": [{"pid": 124, "started": "start-time"}]}},
-      "containers": {"redis": {"container_id": "<exact ID>"},
-                     "postgres": {"container_id": "<exact ID>"}}}}
+      "containers": {
+        "redis": {"container_id": "<exact ID>", "name": "trial-1-cache",
+                  "run_id": "trial-1", "preexisting": false, "validated": true},
+        "postgres": {"container_id": "<exact ID>", "name": "trial-1-postgres",
+                     "run_id": "trial-1", "preexisting": false, "validated": true}}}}
 The harness must prove listener PID/start-time ownership and container ownership
 for this run, rejecting pre-existing listeners. The verifier requires complete
 matching records, not merely a boolean; absent/invalid ownership means unknown
@@ -210,6 +215,8 @@ def check_ownership(metadata, frontend_url, admin_url):
             item = endpoints.get(name)
             if not isinstance(item, dict) or normalized_url(item.get("url")) != url:
                 raise ValueError("Endpoint ownership URL does not match the selected run")
+            if item.get("run_id") != run_id or item.get("preexisting") is not False:
+                raise ValueError("Endpoint ownership must identify a fresh listener in the exact run")
             parsed = urllib.parse.urlsplit(url)
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
             if type(item.get("port")) is not int or item["port"] != port:
@@ -227,6 +234,10 @@ def check_ownership(metadata, frontend_url, admin_url):
             item = containers.get(service)
             if not isinstance(item, dict) or item.get("container_id") != spec["container_id"]:
                 raise ValueError("Container ownership ID does not match the selected run")
+            if (item.get("run_id") != run_id or item.get("preexisting") is not False
+                    or item.get("validated") is not True or not isinstance(item.get("name"), str)
+                    or not item["name"].strip()):
+                raise ValueError("Container ownership must validate a named fresh container in the exact run")
         return outcome("pass", "Trusted exact-run endpoint listeners and container ownership are bound")
     except (ValueError, TypeError, ProbeError) as error:
         return outcome("unknown", "Runtime ownership is not established: " + str(error))

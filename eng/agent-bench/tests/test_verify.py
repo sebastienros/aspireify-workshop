@@ -126,12 +126,14 @@ class SnapshotCase(unittest.TestCase):
         for name, url in (("frontend", frontend), ("admin", admin)):
             parsed = verify.urllib.parse.urlsplit(url)
             endpoints[name] = {"url": url, "port": parsed.port or 80,
+                               "run_id": "fixture", "preexisting": False,
                                "listener_processes": [{"pid": 123, "started": "fixture-start"}]}
         return self.metadata(
             redis={"container_id": CONTAINER_ID},
             postgres={"container_id": CONTAINER_ID, "user": "postgres", "database": "bingo"},
             ownership={"validated": True, "run_id": "fixture", "errors": [], "endpoints": endpoints,
-                       "containers": {service: {"container_id": CONTAINER_ID}
+                       "containers": {service: {"container_id": CONTAINER_ID, "name": "fixture-" + service,
+                                               "run_id": "fixture", "preexisting": False, "validated": True}
                                       for service in ("redis", "postgres")}})
 
 
@@ -257,6 +259,26 @@ class MetadataAndContainerTests(SnapshotCase):
         for metadata in broken:
             with self.subTest(metadata=metadata):
                 self.assertEqual(verify.check_ownership(metadata, frontend, admin)["status"], "unknown")
+
+    def test_ownership_rejects_missing_or_invalid_per_resource_freshness_and_run_identity(self):
+        frontend, admin = "http://localhost:5001", "http://localhost:5000"
+        good = self.owned_metadata(frontend, admin)
+        for group, service, field, bad_values in (
+                ("endpoints", "admin", "preexisting", (None, True, 0, "")),
+                ("endpoints", "frontend", "run_id", (None, "another-run", "")),
+                ("containers", "redis", "preexisting", (None, True, 0, "")),
+                ("containers", "postgres", "run_id", (None, "another-run", "")),
+                ("containers", "postgres", "validated", (None, False, 1, "true")),
+                ("containers", "redis", "name", (None, "", " ", 123))):
+            for value in bad_values:
+                metadata = copy.deepcopy(good)
+                item = metadata["ownership"][group][service]
+                if value is None:
+                    del item[field]
+                else:
+                    item[field] = value
+                with self.subTest(group=group, service=service, field=field, value=value):
+                    self.assertEqual(verify.check_ownership(metadata, frontend, admin)["status"], "unknown")
 
     def test_metadata_bound_to_exact_workspace_variant_and_endpoints(self):
         result, check = self.load(self.metadata(frontend_url="http://localhost:5001/"))
@@ -566,6 +588,25 @@ class HttpAndCliTests(SnapshotCase):
         self.assertEqual(result["repair"]["status"], "unknown")
         self.assertTrue(result["diagnosis_success"])
 
+    def test_preexisting_endpoint_or_unvalidated_container_blocks_all_runtime_traffic(self):
+        write_json(self.diagnosis_path, self.answer())
+        for group, service, field, value in (
+                ("endpoints", "admin", "preexisting", True),
+                ("containers", "postgres", "validated", False)):
+            metadata = self.owned_metadata("http://localhost:5001", "http://localhost:5039")
+            metadata["ownership"][group][service][field] = value
+            args = self.args("http://localhost:5001", "http://localhost:5039")
+            args.runtime_metadata = str(write_json(self.root / "runtime.json", metadata))
+            with self.subTest(group=group), patch.object(verify, "http_get") as http, \
+                    patch.object(verify, "command") as command, \
+                    patch.object(verify, "check_signalr") as signalr:
+                result = verify.verify(args)
+                http.assert_not_called()
+                command.assert_not_called()
+                signalr.assert_not_called()
+            self.assertEqual(result["repair"]["status"], "unknown")
+            self.assertTrue(result["diagnosis_success"])
+
     def test_owned_but_unreachable_runtime_is_explicitly_failed(self):
         with HttpFixture() as url:
             pass
@@ -808,6 +849,7 @@ class LiveApplicationTests(unittest.TestCase):
             source = start / "src"
             player = source / "bingo-board"
             containers, processes, logs = [], [], []
+            container_names = {}
             env = {**os.environ, "DOTNET_CLI_USE_MSBUILD_SERVER": "0",
                    "DOTNET_CLI_TELEMETRY_OPTOUT": "1"}
 
@@ -827,6 +869,7 @@ class LiveApplicationTests(unittest.TestCase):
                 self.assertRegex(container_id, r"^[a-f0-9]{64}$")
                 containers.append(container_id)
                 mapping = json.loads(run(["docker", "inspect", "--type", "container", container_id]))
+                container_names[container_id] = mapping[0]["Name"].lstrip("/")
                 return container_id, mapping[0]["NetworkSettings"]["Ports"][str(port) + "/tcp"][0]["HostPort"]
 
             def available_port():
@@ -862,7 +905,7 @@ class LiveApplicationTests(unittest.TestCase):
                                  "Fixture endpoint must belong exclusively to its registered process")
                 started = run(["ps", "-p", str(process.pid), "-o", "lstart="])
                 self.assertTrue(started)
-                return {"url": url, "port": port,
+                return {"url": url, "port": port, "run_id": root.name, "preexisting": False,
                         "listener_processes": [{"pid": process.pid, "started": started}]}
 
             try:
@@ -933,8 +976,11 @@ class LiveApplicationTests(unittest.TestCase):
                         "validated": True, "run_id": root.name, "errors": [],
                         "endpoints": {"admin": listener_evidence(admin_url, admin),
                                       "frontend": listener_evidence(frontend_url, frontend)},
-                        "containers": {"redis": {"container_id": redis},
-                                       "postgres": {"container_id": postgres}},
+                        "containers": {
+                            service: {"container_id": container_id, "name": container_names[container_id],
+                                      "run_id": root.name, "preexisting": False, "validated": True}
+                            for service, container_id in (("redis", redis), ("postgres", postgres))
+                        },
                     },
                 })
                 write_json(root / "diagnosis.json", {"diagnoses": []})
