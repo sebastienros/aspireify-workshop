@@ -229,12 +229,11 @@ def transform_fixture(workspace: Path, variant: str, trial_id: str,
             r"(?<!\d)(5432|6379|5039|5173)(?!\d)",
             lambda match: str(ports[int(match[0])]), text),
             "Deterministic free-port remap (all fixture host references, including Aspire proxies)")
-    if variant == "raw":
-        replace(start / "compose.yaml", lambda text: text.replace(
-            '"5432:5432"', f'"{ports[5432]}:5432"').replace(
-            '"6379:6379"', f'"{ports[6379]}:6379"'),
-            "Compose host ports only; container ports unchanged")
-    else:
+    replace(start / "compose.yaml", lambda text: text.replace(
+        '"5432:5432"', f'"{ports[5432]}:5432"').replace(
+        '"6379:6379"', f'"{ports[6379]}:6379"'),
+        "Compose host ports in every arm; container ports unchanged")
+    if variant != "raw":
         path = workspace / f"demo/checkpoints/03-observe/{variant}/apphost."
         path = Path(str(path) + ("mts" if variant == "typescript" else "cs"))
         if variant == "typescript":
@@ -1298,8 +1297,6 @@ def cleanup_raw_scope_drift(workspace: Path, env: dict, output: Path, runtime: d
         labels = container["Config"].get("Labels") or {}
         project = labels.get("com.docker.compose.project")
         service = labels.get("com.docker.compose.service")
-        if project == runtime["run_id"]:
-            continue
         target = 5432 if service == "postgres" else 6379 if service == "redis" else None
         bindings = container.get("HostConfig", {}).get("PortBindings", {}).get(f"{target}/tcp") or []
         if (identifier in before["container_ids"] or not project or target is None or
@@ -1331,7 +1328,8 @@ def cleanup_raw_scope_drift(workspace: Path, env: dict, output: Path, runtime: d
                 not set(network.get("Containers", {})).issubset(selected)):
             raise BenchError("Refused to remove scope-drift network with foreign ownership",
                              "infrastructure_error")
-    evidence = {"scope_violation": bool(proof), "grading_ownership_relaxed": False,
+    evidence = {"scope_violation": any(item["project"] != runtime["run_id"] for item in proof),
+                "auxiliary_compose_resources": bool(proof), "grading_ownership_relaxed": False,
                 "containers": proof, "volumes": volumes, "networks": networks}
     write_json(output / "scope-drift-cleanup.json", evidence)
     for item in proof:
@@ -1361,21 +1359,29 @@ def teardown(workspace: Path, env: dict, trial: dict, output: Path, runtime: dic
             errors.append("Exact-target Aspire stop failed; see teardown-aspire.log")
     records = runtime.get("processes", [])
     errors.extend(terminate_recorded(records))
+    compose_containers, compose_volumes = set(), set()
+    if (output / "preexisting-runtime.json").exists():
+        errors.extend(cleanup_raw_scope_drift(workspace, env, output, runtime))
+        supplemental = read_json(output / "scope-drift-cleanup.json")
+        compose_containers = {item["container_id"] for item in supplemental["containers"]}
+        compose_volumes = set(supplemental["volumes"])
     for identifier in runtime.get("containers", []):
+        if identifier in compose_containers:
+            continue
         result = execute(["docker", "rm", "-f", identifier], cwd=workspace, env=env, check=False)
         if result.returncode and docker_inspect(identifier, workspace, env):
             errors.append(f"Trial container removal failed: {identifier}")
     allowed_volume = (f"{runtime['run_id']}_bingo-postgres-data" if trial["variant"] == "raw"
                       else f"{runtime['run_id']}-postgres-data")
     for name in runtime.get("volumes", []):
+        if name in compose_volumes:
+            continue
         if name != allowed_volume:
             errors.append(f"Refused to remove unexpected volume: {name}")
             continue
         result = execute(["docker", "volume", "rm", name], cwd=workspace, env=env, check=False)
         if result.returncode:
             errors.append(f"Trial volume removal failed: {name}")
-    if trial["variant"] == "raw" and (output / "preexisting-runtime.json").exists():
-        errors.extend(cleanup_raw_scope_drift(workspace, env, output, runtime))
     table = process_table()
     remaining = [record for record in records if record["pid"] in table and
                  table[record["pid"]]["started"] == record["started"]]
@@ -1575,7 +1581,7 @@ def run_trial(config: dict, trial: dict, output: Path, *, calibration: bool) -> 
     result = {"schema_version": 1, "trial_id": trial_id, "trial": trial,
               "workspace": str(workspace), "scratch_home": str(home), "calibration": calibration,
               "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-              "protocol_sha256": protocol_hash(),
+              "protocol_sha256": protocol_hash(), "protocol_version": PROTOCOL_VERSION,
               "harness_commit": execute(["git", "rev-parse", "HEAD"], cwd=REPO).stdout.strip(),
               "harness_files": file_manifest(HERE, ignore=True),
               "verifier_pin": config.get("verifier"),
@@ -1746,6 +1752,9 @@ def load_config(path: Path) -> dict:
     return config
 
 
+PROTOCOL_VERSION = "all-arm-compose-remap-v2"
+
+
 def protocol_hash() -> str:
     tree = ast.parse((HERE / "runner.py").read_text())
     ignored = {"main", "trial_plan", "paired_summary", "validate_reuse", "validate_fixture_gates"}
@@ -1827,7 +1836,8 @@ def run_fixture_probe(config: dict, output: Path, *, negative: bool,
               "trial_id": trial_id, "workspace": str(workspace),
               "paid_model_calls": 0, "status": "infrastructure_error",
               "probe_variant": variant,
-              "protocol_sha256": protocol_hash(), "verifier_pin": config["verifier"]}
+              "protocol_sha256": protocol_hash(), "protocol_version": PROTOCOL_VERSION,
+              "verifier_pin": config["verifier"]}
     try:
         result["snapshot"] = archive_snapshot(HEALTHY, workspace, variant)
         if negative:
@@ -2121,6 +2131,7 @@ def main() -> int:
             "prompt_sha256": digest((HERE / "task-prompt.txt").read_bytes()),
             "reused": {str(key): result["reused_result_path"] for key, result in reused.items()},
             "unpaid_fixture_gates": gates, "protocol_sha256": protocol_hash(),
+            "protocol_version": PROTOCOL_VERSION,
             "ordering_adjustment": "Already-executed arms and their matched counterparts come first"
             if reused else None,
         })

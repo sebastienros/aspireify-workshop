@@ -112,6 +112,18 @@ original configuration as configuration-error calibration evidence, not a
 repair failure. Paired deltas are descriptive observations at **n=1** per arm:
 no confidence intervals, significance, or general efficiency claims.
 
+**Historical smoke versus future fixtures:** The eight captured primary attempts
+precede `all-arm-compose-remap-v2`. Their original manifests are immutable:
+TypeScript's auxiliary raw Compose file still mapped 5432/6379, although its
+scripts/docs and selected AppHost were remapped. Luna/TypeScript additionally
+started raw Compose inside its assigned project; its verified runtime/strict
+scores remain, with a disclosed protocol deviation and corrected supplemental
+cleanup. The future v2 protocol remaps Compose host references in **every** arm
+and enumerates fresh exact-workspace auxiliary Compose resources during teardown.
+This is not retroactively applied to the historical smoke or a paid repetition.
+Full-matrix readiness still requires dedicated daemon/VM containment and explicit
+external skill variants; this smoke alone does not establish it.
+
 ## Configuration and fixture
 
 JSON configs accept either explicit `trials` or a Cartesian product of `models`,

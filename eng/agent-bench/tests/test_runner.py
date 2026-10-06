@@ -48,9 +48,9 @@ class FixtureTests(unittest.TestCase):
                 self.assertIn("allkeys-lfr", compose)
                 self.assertIn("postgres:18", compose)
                 self.assertIn("/var/lib/postgresql\n", compose)
+                self.assertIn('"25001:5432"', compose)
+                self.assertIn('"25002:6379"', compose)
                 if variant == "raw":
-                    self.assertIn('"25001:5432"', compose)
-                    self.assertIn('"25002:6379"', compose)
                     for path in (root / "demo/start/scripts").glob("*"):
                         self.assertNotRegex(path.read_text(), r"(?<!\d)(5432|6379|5039|5173)(?!\d)")
                 else:
