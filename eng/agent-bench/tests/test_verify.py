@@ -430,6 +430,57 @@ class ContractTests(SnapshotCase):
         self.assertEqual(verify.check_contracts(
             self.workspace, self.source, "raw", None, None)["status"], "unknown")
 
+    def test_exact_provider_backed_version_alias_is_additive_and_preserves_contracts(self):
+        path = Path("BingoBoard.Admin/Program.cs")
+        healthy = (REPO / "demo/start/src" / path).read_text().replace(
+            'app.MapGet("/api/version",', 'app.MapGet("/api/version-info",')
+        mapping = ('app.MapGet("/api/version-info", (AppVersionInfoProvider versionInfoProvider)'
+                   ' => versionInfoProvider.GetVersionInfo());')
+        alias = mapping.replace('"/api/version-info"', '"/api/version"')
+        write(self.baseline / "demo/start/src" / path, healthy)
+        for replacement in (alias + "\n" + mapping, mapping + "\n" + alias):
+            write(self.source / path, healthy.replace(mapping, replacement))
+            with self.subTest(alias_order=replacement):
+                self.assertEqual(self.check()["status"], "pass")
+
+    def test_version_alias_exception_does_not_permit_weakened_or_fake_handlers(self):
+        path = Path("BingoBoard.Admin/Program.cs")
+        healthy = (REPO / "demo/start/src" / path).read_text().replace(
+            'app.MapGet("/api/version",', 'app.MapGet("/api/version-info",')
+        mapping = ('app.MapGet("/api/version-info", (AppVersionInfoProvider versionInfoProvider)'
+                   ' => versionInfoProvider.GetVersionInfo());')
+        alias = mapping.replace('"/api/version-info"', '"/api/version"')
+        write(self.baseline / "demo/start/src" / path, healthy)
+        cases = {
+            "seeded-only": healthy.replace(mapping, alias),
+            "fake-restored-handler": healthy.replace(
+                mapping, alias + '\napp.MapGet("/api/version-info", () => new { success = true });'),
+            "changed-alias-handler": healthy.replace(
+                mapping, 'app.MapGet("/api/version", () => new { success = true });\n' + mapping),
+            "conditional-restored": healthy.replace(mapping, alias + "\nif (false) { " + mapping + " }"),
+            "conditional-alias": healthy.replace(mapping, mapping + "\nif (true) { " + alias + " }"),
+            "duplicate-alias": healthy.replace(mapping, alias + "\n" + alias + "\n" + mapping),
+            "duplicate-restored": healthy.replace(mapping, alias + "\n" + mapping + "\n" + mapping),
+            "different-alias-path": healthy.replace(mapping, alias.replace('"/api/version"', '"/api/other"') + "\n" + mapping),
+            "removed-authentication": healthy.replace(
+                mapping, alias + "\n" + mapping).replace("app.UseAuthentication();", ""),
+            "removed-health": healthy.replace(
+                mapping, alias + "\n" + mapping).replace("app.MapDefaultEndpoints();", ""),
+            "changed-provider": healthy.replace(
+                mapping, alias + "\n" + mapping).replace("GetVersionInfo()", "GetFakeVersionInfo()"),
+        }
+        for name, candidate in cases.items():
+            write(self.source / path, candidate)
+            with self.subTest(case=name):
+                self.assertEqual(self.check()["status"], "fail")
+
+    def test_alias_permission_requires_the_exact_healthy_baseline_mapping(self):
+        mapping = ('app.MapGet("/api/version-info", (AppVersionInfoProvider versionInfoProvider)'
+                   ' => versionInfoProvider.GetVersionInfo());')
+        alias = mapping.replace('"/api/version-info"', '"/api/version"')
+        self.assertFalse(verify.admin_program_contract(alias, alias + mapping))
+        self.assertFalse(verify.admin_program_contract(mapping + mapping, alias + mapping + mapping))
+
     def test_raw_snapshot_needs_no_apphosts(self):
         self.assertEqual(self.check()["status"], "pass")
         write(self.source.parent / "compose.yaml",
@@ -682,6 +733,36 @@ class HttpAndCliTests(SnapshotCase):
         for value in ("nan", "inf", "0", "-1", "61", "bad"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 verify.bounded_timeout(value)
+
+    def test_runtime_and_preservation_success_are_separate_and_repair_requires_both(self):
+        runtime_names = ("workspace", "runtime_metadata", "ownership", "postgres", "migrations",
+                         "redis", "frontend", "version_direct", "version_proxy", *verify.PLAYER_CHECKS)
+        for runtime_status in ("pass", "fail", "unknown"):
+            for contract_status in ("pass", "fail", "unknown"):
+                checks = {name: verify.outcome(runtime_status, "fixture") for name in runtime_names}
+                checks["contracts"] = verify.outcome(contract_status, "fixture")
+                diagnosis = {"success": False, "status": "fail", "faults": {}}
+                result = verify.build_result("typescript", checks, diagnosis)
+                with self.subTest(runtime=runtime_status, contracts=contract_status):
+                    self.assertEqual(result["oracle_version"], "2")
+                    self.assertEqual(result["runtime_workflows_success"], runtime_status == "pass")
+                    self.assertEqual(result["contract_preservation_success"], contract_status == "pass")
+                    self.assertEqual(result["contract_success"], result["contract_preservation_success"])
+                    self.assertEqual(result["repair_success"],
+                                     runtime_status == "pass" and contract_status == "pass")
+                    self.assertEqual(result["runtime_workflows"]["status"], runtime_status)
+                    self.assertEqual(result["contract_preservation"]["status"], contract_status)
+                    self.assertFalse(result["diagnosis_success"])
+
+    def test_missing_checks_remain_unknown_in_separate_success_dimensions(self):
+        result = verify.build_result("raw", {}, {"success": True, "status": "pass", "faults": {}})
+        self.assertFalse(result["runtime_workflows_success"])
+        self.assertFalse(result["contract_preservation_success"])
+        self.assertFalse(result["contract_success"])
+        self.assertFalse(result["repair_success"])
+        self.assertTrue(result["diagnosis_success"])
+        self.assertEqual(result["runtime_workflows"]["status"], "unknown")
+        self.assertEqual(result["contract_preservation"]["status"], "unknown")
 
 
 # This controlled hub emulator replaces only the installed transport dependency.

@@ -49,7 +49,10 @@ if supplied, must match CLI endpoints; absent metadata is unknown, not success.
 the candidate workspace. Without it, contract preservation remains unknown.
 
 Results contain independent repair_success and diagnosis_success booleans,
-per-check pass/fail/unknown states, and separate outcomes for each seeded fault.
+plus runtime_workflows_success and contract_success (also exposed as
+contract_preservation_success), per-check
+pass/fail/unknown states, and separate outcomes for each seeded fault. Overall
+repair requires runtime workflows AND contract preservation; diagnosis is separate.
 Exit 0 means repair success (irrespective of diagnosis), 1 failed/unproved repair,
 and 2 a CLI/output error. All deadlines are bounded; --timeout is per operation.
 """
@@ -68,6 +71,7 @@ import urllib.parse
 import urllib.request
 
 
+ORACLE_VERSION = "2"
 FAULTS = ("HEALTH-01", "CONFIG-01", "INTEROP-01", "INTEROP-02")
 SEED_IDS = (
     "free", "council-of-aspirations", "screen-share-fail", "pine-mentioned",
@@ -373,6 +377,34 @@ def code_tokens(text):
             if not token.startswith("//") and not token.startswith("/*")]
 
 
+def admin_program_contract(before, after):
+    original, candidate = code_tokens(before), code_tokens(after)
+    if original == candidate:
+        return True
+    healthy = code_tokens(
+        'app.MapGet("/api/version-info", (AppVersionInfoProvider versionInfoProvider)'
+        ' => versionInfoProvider.GetVersionInfo());')
+    alias = [token.replace('"/api/version-info"', '"/api/version"') for token in healthy]
+
+    def positions(tokens, sequence):
+        return [i for i in range(len(tokens) - len(sequence) + 1)
+                if tokens[i:i + len(sequence)] == sequence]
+
+    healthy_original = positions(original, healthy)
+    healthy_candidate = positions(candidate, healthy)
+    aliases = positions(candidate, alias)
+    if (len(healthy_original) != 1 or len(healthy_candidate) != 1
+            or positions(original, alias) or len(aliases) != 1):
+        return False
+    start = aliases[0]
+    restored = healthy_candidate[0]
+    # Permit only the seeded route retained adjacent to the exact healthy
+    # provider-backed mapping. Every other Program.cs token stays unchanged.
+    if start + len(alias) != restored and restored + len(healthy) != start:
+        return False
+    return candidate[:start] + candidate[start + len(alias):] == original
+
+
 def mask_player_requests(tokens):
     result = list(tokens)
     for name in ("requestBingoSet", "requestExistingBingoSet"):
@@ -444,6 +476,8 @@ def check_contracts(workspace, source, variant, apphost, baseline):
             before, after = original.read_text(encoding="utf-8-sig"), candidate.read_text(encoding="utf-8-sig")
             if str(relative) == "bingo-board/services/signalrService.js":
                 equal = mask_player_requests(code_tokens(before)) == mask_player_requests(code_tokens(after))
+            elif str(relative) == "BingoBoard.Admin/Program.cs":
+                equal = admin_program_contract(before, after)
             elif original.suffix in {".json", ".csproj", ".props", ".targets"}:
                 equal = before.strip() == after.strip()
             else:
@@ -969,12 +1003,17 @@ def verify(args):
 
 
 def build_result(variant, checks, diagnosis):
-    required = ("workspace", "runtime_metadata", "ownership", "contracts", "postgres", "migrations",
-                "redis", "frontend", "version_direct", "version_proxy", *PLAYER_CHECKS)
+    runtime_required = ("workspace", "runtime_metadata", "ownership", "postgres", "migrations",
+                        "redis", "frontend", "version_direct", "version_proxy", *PLAYER_CHECKS)
+    required = (*runtime_required, "contracts")
     missing = outcome("unknown", "Check could not be performed")
     for name in required:
         checks.setdefault(name, dict(missing))
-    success = all(checks[name]["status"] == "pass" for name in required)
+    runtime_status = aggregate([checks[name] for name in runtime_required])
+    preservation_status = checks["contracts"]["status"]
+    runtime_success = runtime_status == "pass"
+    preservation_success = preservation_status == "pass"
+    success = runtime_success and preservation_success
     faults = {}
     for fault, names in FAULT_CHECKS.items():
         diagnosed = diagnosis.get("faults", {}).get(fault, outcome("fail", "No valid diagnosis"))
@@ -984,8 +1023,14 @@ def build_result(variant, checks, diagnosis):
             "candidate_count": diagnosed.get("candidate_count", 0),
             "checks": list(names),
         }
-    return {"schema_version": 1, "variant": variant, "repair_success": success,
+    return {"schema_version": 1, "oracle_version": ORACLE_VERSION,
+            "variant": variant, "repair_success": success,
+            "runtime_workflows_success": runtime_success,
+            "contract_success": preservation_success,
+            "contract_preservation_success": preservation_success,
             "diagnosis_success": diagnosis["success"],
+            "runtime_workflows": {"success": runtime_success, "status": runtime_status},
+            "contract_preservation": {"success": preservation_success, "status": preservation_status},
             "repair": {"success": success, "status": aggregate([checks[n] for n in required])},
             "diagnosis": diagnosis, "checks": checks, "faults": faults}
 
@@ -1043,6 +1088,9 @@ def main(argv=None):
         finally:
             temporary.unlink(missing_ok=True)
         print(json.dumps({"repair_success": result["repair_success"],
+                          "runtime_workflows_success": result["runtime_workflows_success"],
+                          "contract_success": result["contract_success"],
+                          "contract_preservation_success": result["contract_preservation_success"],
                           "diagnosis_success": result["diagnosis_success"],
                           "output": str(destination)}))
         return 0 if result["repair_success"] else 1
