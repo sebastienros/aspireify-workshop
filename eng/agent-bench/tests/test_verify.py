@@ -193,13 +193,103 @@ class DiagnosisTests(SnapshotCase):
         document["diagnoses"][2]["candidates"][0]["evidence"] = ""
         self.assertFalse(self.score(document)["success"])
 
-    def test_service_and_target_path_are_required(self):
+    def test_correct_root_path_not_exclusive_service_vocabulary_is_required(self):
         document = self.answer()
         document["diagnoses"][1]["candidates"][0]["file"] = "demo/start/src/BingoBoard.Admin/Program.cs"
         self.assertEqual(self.score(document)["faults"]["CONFIG-01"]["status"], "fail")
         document = self.answer()
         document["diagnoses"][0]["service"] = "postgres"
-        self.assertEqual(self.score(document)["faults"]["HEALTH-01"]["status"], "fail")
+        self.assertEqual(self.score(document)["faults"]["HEALTH-01"]["status"], "pass")
+
+    def test_specifics_in_evidence_support_a_concise_causal_conclusion(self):
+        document = self.answer()
+        document["diagnoses"][0]["candidates"][0].update(
+            cause="Misspelled Redis eviction policy prevented startup.",
+            evidence="Redis exited with FATAL CONFIG FILE ERROR for allkeys-lfr; allkeys-lru then passed PING.")
+        document["diagnoses"][1]["candidates"][0].update(
+            cause="Migration worker requested a connection-string name different from the supplied database resource.",
+            evidence="Connection string 'database' is required; changed lookup to 'db', exit 0 and 40 seeded squares.")
+        document["diagnoses"][2]["candidates"][0].update(
+            cause="Backend did not expose the version endpoint used by the player and checks.",
+            evidence="Direct and proxy /api/version-info returned HTTP404 while /api/version worked; corrected route returns JSON.")
+        document["diagnoses"][3]["candidates"][0].update(
+            cause="Frontend passed a single object to hub methods expecting separate clientId and userName arguments.",
+            evidence="Original board invocation failed with no board; after fixing both request methods a 25-square board arrived.")
+        self.assertTrue(self.score(document)["success"])
+
+    def test_distinct_faults_with_overlapping_service_labels_do_not_merge(self):
+        document = self.answer()
+        document["diagnoses"][1]["service"] = "Database migration and admin startup"
+        document["diagnoses"][2]["service"] = "Player frontend version-info proxy and API"
+        document["diagnoses"][3]["service"] = "Player board requests and live updates / admin"
+        result = self.score(document)
+        self.assertTrue(result["success"])
+        self.assertEqual([r["candidate_count"] for r in result["faults"].values()], [1] * 4)
+
+    def test_distinct_extra_footer_and_lifecycle_findings_are_not_seeded_candidates(self):
+        document = self.answer()
+        document["diagnoses"].append({"service": "Player version footer", "candidates": [{
+            "cause": "Frontend used incorrect casing for runtime-version JSON field.",
+            "file": "demo/start/src/bingo-board/App.vue",
+            "evidence": "/api/version-info JSON returns dotNetVersion, footer used dotnetVersion; display now correct."}]})
+        document["diagnoses"].append({"service": "Workflow verification", "candidates": [{
+            "cause": "No source cause. Container name was in use after restart, not a defect in application source.",
+            "file": "demo/start/compose.yaml",
+            "evidence": "A container-name race on restart was resolved; resources became healthy."}]})
+        result = self.score(document)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["faults"]["HEALTH-01"]["candidate_count"], 1)
+        self.assertEqual(result["faults"]["INTEROP-02"]["candidate_count"], 1)
+
+    def test_multiple_known_roots_in_one_row_still_group_by_category(self):
+        document = self.answer()
+        candidate = document["diagnoses"].pop(3)["candidates"][0]
+        document["diagnoses"][2]["candidates"].append(candidate)
+        self.assertTrue(self.score(document)["success"])
+
+    def test_same_fault_alternatives_in_same_or_separate_rows_remain_unresolved(self):
+        for split in (True, False):
+            document = self.answer()
+            alternative = {"cause": "Maybe the Redis port is wrong",
+                           "file": "demo/start/compose.yaml", "evidence": "Connection failed"}
+            if split:
+                document["diagnoses"].append({"service": "A different label", "candidates": [alternative]})
+            else:
+                document["diagnoses"][0]["candidates"].append(alternative)
+            with self.subTest(split=split):
+                self.assertEqual(self.score(document)["faults"]["HEALTH-01"]["candidate_count"], 2)
+
+    def test_wrong_conclusions_cannot_be_rescued_by_quoted_correct_evidence(self):
+        for index, cause in (
+                (0, "A Redis port conflict caused startup failure."),
+                (0, "Maybe Redis has an invalid allkeys-lfr policy or a port conflict."),
+                (0, "The Redis policy allkeys-lru is invalid."),
+                (0, "Redis allkeys-lfr is a supported policy and works correctly."),
+                (1, "The worker reads db while startup supplies database."),
+                (2, "The endpoint works correctly; there is no route fault."),
+                (2, "Backend exposes /api/version-info but frontend requests /api/version."),
+                (3, "The SignalR payload works correctly; hub is not the cause.")):
+            document = self.answer()
+            document["diagnoses"][index]["candidates"][0]["cause"] = cause
+            with self.subTest(cause=cause):
+                self.assertEqual(self.score(document)["faults"][verify.FAULTS[index]]["status"], "fail")
+
+    def test_wrong_path_and_missing_observations_remain_failures(self):
+        for index in range(4):
+            document = self.answer()
+            document["diagnoses"][index]["candidates"][0]["file"] = "demo/start/src/bingo-board/App.vue"
+            self.assertEqual(self.score(document)["faults"][verify.FAULTS[index]]["status"], "fail")
+            document = self.answer()
+            document["diagnoses"][index]["candidates"][0]["evidence"] = "I think this is fixed"
+            self.assertEqual(self.score(document)["faults"][verify.FAULTS[index]]["status"], "fail")
+
+    def test_trailing_prose_and_fenced_json_remain_malformed(self):
+        for content in (json.dumps(self.answer()) + "\nI fixed the app",
+                        "```json\n" + json.dumps(self.answer()) + "\n```"):
+            write(self.diagnosis_path, content)
+            result = verify.score_diagnosis(
+                self.diagnosis_path, self.workspace, self.source, None, "raw")
+            self.assertFalse(result["success"])
 
     def test_cause_negation_and_generic_symptoms_are_not_diagnoses(self):
         for cause in ("Redis is down", "allkeys-lfr is not invalid and works correctly"):
@@ -813,7 +903,7 @@ class HttpAndCliTests(SnapshotCase):
                 diagnosis = {"success": False, "status": "fail", "faults": {}}
                 result = verify.build_result("typescript", checks, diagnosis)
                 with self.subTest(runtime=runtime_status, contracts=contract_status):
-                    self.assertEqual(result["oracle_version"], "4")
+                    self.assertEqual(result["oracle_version"], "5")
                     self.assertEqual(result["runtime_workflows_success"], runtime_status == "pass")
                     self.assertEqual(result["contract_preservation_success"], contract_status == "pass")
                     self.assertEqual(result["contract_success"], result["contract_preservation_success"])
@@ -832,6 +922,44 @@ class HttpAndCliTests(SnapshotCase):
         self.assertTrue(result["diagnosis_success"])
         self.assertEqual(result["runtime_workflows"]["status"], "unknown")
         self.assertEqual(result["contract_preservation"]["status"], "unknown")
+
+    def test_supplemental_diagnosis_only_has_provenance_and_no_runtime_or_candidate_reads(self):
+        write_json(self.diagnosis_path, self.answer())
+        output = self.root / "supplemental-v5.json"
+        args = ["--diagnosis-only", "--workspace", str(self.workspace), "--variant", "raw",
+                "--diagnosis", str(self.diagnosis_path), "--output", str(output),
+                "--oracle-commit", "a" * 40]
+        shutil.rmtree(self.workspace)
+        with patch.object(verify, "verify") as runtime, patch.object(verify, "http_get") as http, \
+                patch.object(verify, "command") as command, patch.object(verify, "find_source") as source, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(verify.main(args), 0)
+            runtime.assert_not_called()
+            http.assert_not_called()
+            command.assert_not_called()
+            source.assert_not_called()
+        result = verify.read_json(output)
+        self.assertEqual(result["oracle_version"], "5")
+        self.assertEqual(result["oracle_commit"], "a" * 40)
+        self.assertFalse(result["runtime_evaluated"])
+        self.assertNotIn("repair_success", result)
+        self.assertEqual(result["diagnosis_input_sha256"],
+                         verify.hashlib.sha256(self.diagnosis_path.read_bytes()).hexdigest())
+        before = output.read_bytes()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            verify.main(args)
+        self.assertEqual(output.read_bytes(), before)
+
+    def test_supplemental_malformed_answer_is_not_prose_extracted(self):
+        write(self.diagnosis_path, "```json\n" + json.dumps(self.answer()) + "\n```")
+        args = ["--diagnosis-only", "--workspace", str(self.workspace), "--variant", "raw",
+                "--diagnosis", str(self.diagnosis_path), "--output", str(self.root / "supplemental.json"),
+                "--oracle-commit", "a" * 40]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(verify.main(args), 1)
+        result = verify.read_json(self.root / "supplemental.json")
+        self.assertFalse(result["diagnosis_success"])
+        self.assertEqual(result["diagnosis"]["status"], "fail")
 
 
 # This controlled hub emulator replaces only the installed transport dependency.

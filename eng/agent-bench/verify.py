@@ -55,9 +55,17 @@ pass/fail/unknown states, and separate outcomes for each seeded fault. Overall
 repair requires runtime workflows AND contract preservation; diagnosis is separate.
 Exit 0 means repair success (irrespective of diagnosis), 1 failed/unproved repair,
 and 2 a CLI/output error. All deadlines are bounded; --timeout is per operation.
+
+--diagnosis-only emits a NEW supplemental diagnosis score without reading the
+candidate source, contacting runtime endpoints, or replacing frozen repair
+results. --source-layout defaults to demo/start/src for offline path identity.
+--oracle-commit can bind an externally copied verifier to its harness-recorded
+revision; the output also records the verifier file and input SHA-256 hashes.
+Offline exit 0/1 indicates diagnosis success/failure, never repair success.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -71,7 +79,7 @@ import urllib.parse
 import urllib.request
 
 
-ORACLE_VERSION = "4"
+ORACLE_VERSION = "5"
 FAULTS = ("HEALTH-01", "CONFIG-01", "INTEROP-01", "INTEROP-02")
 SEED_IDS = (
     "free", "council-of-aspirations", "screen-share-fail", "pine-mentioned",
@@ -247,30 +255,6 @@ def check_ownership(metadata, frontend_url, admin_url):
         return outcome("unknown", "Runtime ownership is not established: " + str(error))
 
 
-SERVICE_ALIASES = {
-    "HEALTH-01": {"redis", "cache"},
-    "CONFIG-01": {"migrations", "migration", "migrationworker",
-                  "bingoboardmigrationservice"},
-    "INTEROP-01": {"boardadmin", "admin", "backend", "bingoboardadmin"},
-    "INTEROP-02": {"bingoboard", "frontend", "player", "devfrontend",
-                   "playerfrontend", "bingoboardfrontend"},
-}
-
-
-def canonical_service(service):
-    return re.sub(r"[^a-z0-9]", "", service.lower())
-
-
-def service_faults(service):
-    canonical = canonical_service(service)
-    exact = {fault for fault, aliases in SERVICE_ALIASES.items() if canonical in aliases}
-    if exact:
-        return exact
-    # Harnesses may prefix resource names to isolate trials.
-    words = set(re.findall(r"[a-z0-9]+", service.lower()))
-    return {fault for fault, aliases in SERVICE_ALIASES.items() if words & aliases}
-
-
 def diagnosis_path_matches(fault, filename, workspace, source, apphost, variant):
     if not isinstance(filename, str) or not filename.strip():
         return False
@@ -290,31 +274,59 @@ def diagnosis_path_matches(fault, filename, workspace, source, apphost, variant)
     return target is not None and resolved == target.resolve()
 
 
+def diagnosis_text(value):
+    return re.sub(r"\s+", " ", value.lower().replace("`", "").replace("-", " ")).strip()
+
+
+def diagnosis_categories(cause, evidence):
+    text = diagnosis_text(cause + " " + evidence)
+    categories = set()
+    if re.search(r"allkeys|eviction policy|maxmemory.policy|fatal config", text):
+        categories.add("HEALTH-01")
+    if re.search(r"connection.?string|connection.*(?:key|lookup)|getconnectionstring", text):
+        categories.add("CONFIG-01")
+    if re.search(r"/api/version|version.*(?:endpoint|route)|(?:endpoint|route).*version", text):
+        categories.add("INTEROP-01")
+    if re.search(r"request(?:existing)?bingoset|board.?request|hub.*(?:argument|payload)|signalr.*(?:argument|payload)", text):
+        categories.add("INTEROP-02")
+    if not categories and re.search(r"no source cause|not a defect in.*source", text):
+        categories.add("unseeded-lifecycle")
+    return categories
+
+
 def semantic_diagnosis(fault, cause, evidence):
-    cause, evidence = cause.lower(), evidence.lower()
+    cause, evidence = diagnosis_text(cause), diagnosis_text(evidence)
     text = cause + "\n" + evidence
-    if re.search(r"\b(not the cause|not a fault|works correctly|not invalid)\b", cause):
+    if re.search(
+            r"\b(not the cause|not a fault|works correctly|not invalid|no source cause|"
+            r"maybe|possibly|could be|either|alternatively)\b|"
+            r"\bor\b.*\b(port|authentication|password|network|firewall|proxy)\b", cause):
         return False
     if fault == "HEALTH-01":
-        return (bool(re.search(r"(allkeys-lfr|maxmemory.policy|eviction policy)", cause))
-                and bool(re.search(r"invalid|unsupported|typo|incorrect|wrong|reject|not valid", cause))
-                and bool(re.search(r"allkeys-lfr|invalid.*policy|fatal.*config|bad directive", evidence)))
+        return (bool(re.search(r"allkeys|maxmemory.policy|eviction policy", cause))
+                and not re.search(r"(?:invalid|unsupported|wrong).*allkeys (?:lru|lfu)\b|allkeys (?:lru|lfu).*(?:invalid|unsupported)", cause)
+                and not re.search(r"\b(?:valid|supported|correct) (?:redis )?(?:eviction )?policy\b|policy (?:is )?(?:valid|supported)", cause)
+                and bool(re.search(r"invalid|unsupported|non.existent|typo|misspell|incorrect|wrong|reject|not valid|not.*support", text))
+                and "allkeys lfr" in text
+                and bool(re.search(r"fatal.*config|reject|invalid|not.*valid|error|failed|exit", evidence)))
     if fault == "CONFIG-01":
-        return (bool(re.search(r"\bdatabase\b", cause)) and bool(re.search(r"\bdb\b", text))
-                and bool(re.search(r"key|connection.string|configuration|lookup|injected", cause))
-                and bool(re.search(r"mismatch|wrong|instead|expects|reads|required", cause))
+        return (bool(re.search(r"\bdatabase\b", text)) and bool(re.search(r"\bdb\b", text))
+                and not re.search(r"(?:reads?|requests?|requires?)\s+(?:connection.?string\s+(?:key|named)?\s*)?[\"']?db[\"']?.*(?:while|instead|but).*(?:provid|suppl|inject).*database", cause)
+                and bool(re.search(r"connection.?string|configuration.*key|lookup", cause))
+                and bool(re.search(r"mismatch|different|wrong|instead|expect|read|request|requir|while|provide|suppl", cause))
                 and bool(re.search(r"connection string.*database.*required|getconnectionstring.*database", evidence)))
     if fault == "INTEROP-01":
-        return (bool(re.search(r"/api/version(?!-info)", text)) and "/api/version-info" in cause
-                and bool(re.search(r"route|endpoint|path", cause))
-                and bool(re.search(r"wrong|renamed|instead|mismatch|missing|expos|404", cause))
-                and bool(re.search(r"404|mapget.*?/api/version(?!-info)", evidence)))
-    return (bool(re.search(r"request(?:existing)?bingoset|board.request", cause))
-            and bool(re.search(r"object|payload", cause))
-            and bool(re.search(r"positional|two.*(?:argument|string)|2.*argument", text))
-            and bool(re.search(r"argument|invoke|hub|signalr", evidence))
-            and bool(re.search(r"object|expects.*two|expects.*2|argument.*(?:count|match)|invocation.*(?:fail|error)", evidence))
-            and bool(re.search(r"requestexistingbingoset", text)))
+        return (bool(re.search(r"/api/version(?! info)", text)) and "/api/version info" in text
+                and not re.search(r"backend.*(?:expos|map|register).*version info.*(?:while|but).*frontend.*version(?! info)", cause)
+                and bool(re.search(r"route|endpoint|path|backend.*expos|frontend.*request", cause))
+                and bool(re.search(r"wrong|renamed|instead|mismatch|missing|not.*expose|only|expos|404|while|but", cause))
+                and bool(re.search(r"404|not found|mapget|backend.*(?:expos|register)", evidence)))
+    return (bool(re.search(r"frontend|player|signalr|hub|request|invoke", cause))
+            and bool(re.search(r"object|payload", text))
+            and bool(re.search(r"positional|two.*(?:argument|string)|2.*argument|separate.*argument|clientid.*username.*argument", text))
+            and bool(re.search(r"argument|invoke|hub|signalr|invocation|board", evidence))
+            and bool(re.search(r"fail|error|mismatch|expect|no board|zero squares|25.square|bingosetreceived", evidence))
+            and bool(re.search(r"requestexistingbingoset|both.*(?:request|invoke)|board request methods|both board", text)))
 
 
 def score_diagnosis(path, workspace, source, apphost, variant):
@@ -327,6 +339,7 @@ def score_diagnosis(path, workspace, source, apphost, variant):
         groups = {fault: [] for fault in FAULTS}
         for row in document["diagnoses"]:
             if (not isinstance(row, dict) or not isinstance(row.get("service"), str)
+                    or not row["service"].strip()
                     or not isinstance(row.get("candidates"), list) or not row["candidates"]):
                 raise ValueError("Every diagnosis requires service and a nonempty candidates list")
             for candidate in row["candidates"]:
@@ -334,13 +347,22 @@ def score_diagnosis(path, workspace, source, apphost, variant):
                         not isinstance(candidate.get(field), str) or not candidate[field].strip()
                         for field in ("cause", "file", "evidence"))):
                     raise ValueError("Every candidate requires nonempty cause, file, and evidence strings")
-            services = service_faults(row["service"])
-            for fault in FAULTS:
-                paths_match = any(diagnosis_path_matches(
-                    fault, c["file"], workspace, source, apphost, variant)
-                    for c in row["candidates"])
-                if fault in services or paths_match:
-                    groups[fault].extend((c, fault in services) for c in row["candidates"])
+            categorized = [(candidate, diagnosis_categories(candidate["cause"], candidate["evidence"]))
+                           for candidate in row["candidates"]]
+            row_categories = set().union(*(categories for _, categories in categorized))
+            for candidate, categories in categorized:
+                matching_paths = {fault for fault in FAULTS if diagnosis_path_matches(
+                    fault, candidate["file"], workspace, source, apphost, variant)}
+                # A semantic root with the wrong file still fails that root.
+                # Same-row alternative guesses inherit its root(s); service
+                # descriptions never merge distinct root-cause categories.
+                semantic_roots = {fault for fault in categories & set(FAULTS)
+                                  if semantic_diagnosis(fault, candidate["cause"], candidate["evidence"])}
+                assigned = ((categories & matching_paths) or semantic_roots
+                            or (matching_paths if not categories else set())
+                            or (row_categories if not categories and not matching_paths else set()))
+                for fault in assigned & set(FAULTS):
+                    groups[fault].append(candidate)
         for fault, candidates in groups.items():
             count = len(candidates)
             if count != 1:
@@ -348,9 +370,8 @@ def score_diagnosis(path, workspace, source, apphost, variant):
                     "fail", "Exactly one candidate is required for this root cause",
                     candidate_count=count)
                 continue
-            candidate, service_matches = candidates[0]
-            correct = (service_matches
-                       and diagnosis_path_matches(fault, candidate["file"], workspace, source,
+            candidate = candidates[0]
+            correct = (diagnosis_path_matches(fault, candidate["file"], workspace, source,
                                              apphost, variant)
                        and semantic_diagnosis(fault, candidate["cause"], candidate["evidence"]))
             results[fault] = outcome(
@@ -1060,19 +1081,62 @@ def bounded_timeout(value):
     return number
 
 
+def score_supplemental_diagnosis(args):
+    workspace = Path(args.workspace).resolve()
+    source = workspace / args.source_layout
+    apphost = None
+    if args.variant != "raw":
+        if not args.apphost:
+            raise ValueError("--apphost is required to identify the selected diagnosis variant")
+        apphost = Path(args.apphost)
+        if not apphost.is_absolute():
+            apphost = workspace / apphost
+        apphost = apphost.resolve()
+        if not inside(apphost, workspace):
+            raise ValueError("Selected AppHost path must belong to the candidate workspace")
+    commit = args.oracle_commit
+    if commit is None:
+        try:
+            commit = command(["git", "log", "-1", "--format=%H", "--", str(Path(__file__).resolve())],
+                             5, cwd=Path(__file__).resolve().parent).strip()
+        except ProbeError:
+            raise ValueError("Supply --oracle-commit when the verifier is outside its Git checkout") from None
+    if not isinstance(commit, str) or not re.fullmatch(r"[a-fA-F0-9]{40}", commit):
+        raise ValueError("--oracle-commit must identify a full Git commit SHA")
+    diagnosis_path = external_path(args.diagnosis, workspace)
+    diagnosis = score_diagnosis(diagnosis_path, workspace, source, apphost, args.variant)
+    input_hash = None
+    try:
+        if diagnosis_path.stat().st_size <= MAX_BYTES:
+            input_hash = hashlib.sha256(diagnosis_path.read_bytes()).hexdigest()
+    except OSError:
+        pass  # score_diagnosis already reports unavailable input as failure.
+    return {
+        "schema_version": 1, "oracle_version": ORACLE_VERSION, "oracle_commit": commit,
+        "verifier_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "mode": "supplemental-diagnosis-only", "variant": args.variant,
+        "diagnosis_input": str(diagnosis_path), "diagnosis_input_sha256": input_hash,
+        "diagnosis_success": diagnosis["success"], "diagnosis": diagnosis,
+        "runtime_evaluated": False, "frozen_results_modified": False,
+    }
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     result.add_argument("--workspace", required=True)
     result.add_argument("--variant", required=True, choices=("raw", "typescript", "csharp"))
     result.add_argument("--apphost")
-    result.add_argument("--frontend-url", required=True)
-    result.add_argument("--admin-url", required=True)
+    result.add_argument("--frontend-url")
+    result.add_argument("--admin-url")
     result.add_argument("--diagnosis", required=True)
     result.add_argument("--output", required=True)
     result.add_argument("--runtime-metadata")
     result.add_argument("--baseline")
     result.add_argument("--timeout", type=bounded_timeout, default=10.0)
     result.add_argument("--container-runtime", choices=("podman", "docker"))
+    result.add_argument("--diagnosis-only", action="store_true")
+    result.add_argument("--source-layout", choices=SOURCE_LAYOUTS, default="demo/start/src")
+    result.add_argument("--oracle-commit")
     return result
 
 
@@ -1085,7 +1149,14 @@ def main(argv=None):
             raise ValueError("Output cannot overwrite evaluator inputs")
         if args.baseline and inside(destination, Path(args.baseline)):
             raise ValueError("Output cannot overwrite the trusted baseline")
-        result = verify(args)
+        if args.diagnosis_only:
+            if destination.exists():
+                raise ValueError("Supplemental output must be NEW; existing results cannot be overwritten")
+            result = score_supplemental_diagnosis(args)
+        else:
+            if not args.frontend_url or not args.admin_url:
+                raise ValueError("--frontend-url and --admin-url are required for runtime verification")
+            result = verify(args)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination.parent,
                                          prefix=".verifier-", delete=False) as stream:
@@ -1099,9 +1170,18 @@ def main(argv=None):
                 temporary.unlink(missing_ok=True)
                 raise
         try:
-            temporary.replace(destination)
+            if args.diagnosis_only:
+                os.link(temporary, destination)  # Atomically refuse to replace a frozen artifact.
+            else:
+                temporary.replace(destination)
         finally:
             temporary.unlink(missing_ok=True)
+        if args.diagnosis_only:
+            print(json.dumps({"oracle_version": result["oracle_version"],
+                              "oracle_commit": result["oracle_commit"],
+                              "diagnosis_success": result["diagnosis_success"],
+                              "runtime_evaluated": False, "output": str(destination)}))
+            return 0 if result["diagnosis_success"] else 1
         print(json.dumps({"repair_success": result["repair_success"],
                           "runtime_workflows_success": result["runtime_workflows_success"],
                           "contract_success": result["contract_success"],
