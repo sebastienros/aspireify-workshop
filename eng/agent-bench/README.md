@@ -24,6 +24,9 @@ selected with a generated trial-local `global.json`, not the default SDK 11 RC.
 From the repository worktree:
 
 ```bash
+# Reproduce both unpaid gates and all eight primary attempts in a fresh directory:
+bash eng/agent-bench/run-primary.sh /absolute/external/new-results
+
 python3 -B -m unittest discover -s eng/agent-bench/tests -q
 
 # Model authentication, usage capture, and bare/skills/MCP ablations only:
@@ -36,10 +39,23 @@ python3 eng/agent-bench/runner.py calibrate \
   --config eng/agent-bench/configs/skill-capability.json \
   --output /absolute/external/results/skill
 
-# Requires an explicitly supplied, committed verifier. No PR or matrix is opened:
+# Unpaid gates: exact healthy AppHost, then the healthy fixture with the original
+# seeded player-call file. Both must pass ownership, runtime and cleanup checks.
+python3 eng/agent-bench/runner.py probe \
+  --config eng/agent-bench/configs/primary-pairs.json \
+  --verifier-commit d7b758209fd2deecda5075a1292853f3d569e214 \
+  --output /absolute/external/results/healthy
+python3 eng/agent-bench/runner.py probe --seeded-negative \
+  --config eng/agent-bench/configs/primary-pairs.json \
+  --verifier-commit d7b758209fd2deecda5075a1292853f3d569e214 \
+  --output /absolute/external/results/seeded-negative
+
+# Requires a committed verifier and compatible unpaid gates. No PR/matrix opened:
 python3 eng/agent-bench/runner.py run \
   --config eng/agent-bench/configs/primary-pairs.json \
-  --verifier-commit 069b1bcd7645e7c7b99a1efdd587106eb3b2f1b6 \
+  --verifier-commit d7b758209fd2deecda5075a1292853f3d569e214 \
+  --fixture-gate /absolute/external/results/healthy/fixture/result.json \
+  --fixture-gate /absolute/external/results/seeded-negative/fixture/result.json \
   --output /absolute/external/results/primary-pairs
 
 # Optional: retain a protocol-compatible already-completed arm without paying again:
@@ -111,6 +127,14 @@ configuration, prompt, source, verifier, recorded execution-function code and to
 shim, valid treatment evidence, native usage, and completed cleanup. Scheduler-only
 changes do not invalidate otherwise identical prior evidence.
 
+Primary paid execution is refused unless both unpaid gate artifacts have the
+current execution-protocol hash, verifier, SDK/version/seed pins, proven ownership
+and clean teardown. A failed healthy fixture is never charged as an agent repair
+failure. Protocol changes invalidate prior gates and prior-arm reuse; original
+costs/findings remain separate historical evidence. The initial Sol/TypeScript
+result is infrastructure-invalid, not an agent failure: scratch HTTPS setup,
+endpoint attribution and authenticated data-store probing were then incomplete.
+
 `git archive` exports only `demo/start`, the root ignore rules, and exactly one
 selected `demo/checkpoints/03-observe/<language>` for Aspire arms. The raw arm has
 no AppHost. Static nginx deployment files, other checkpoints, evaluator files,
@@ -126,11 +150,15 @@ Recorded fixture transformations are deliberately not repairs:
   changed to `/var/lib/postgresql`, the PostgreSQL 18 layout. Aspire documentation
   confirms `WithDataVolume` is version-aware at invocation time; image tags are
   selected before it. Fresh trial volumes never reuse PostgreSQL 17 data.
-- Reserve deterministic currently-free raw host ports and rewrite **every**
+- Reserve deterministic currently-free host ports and rewrite **every**
   coupled script, README, environment template, launch profile and Compose host
-  mapping. Container target ports stay 5432/6379. Reservations are released just
+  mapping. Launch-profile remapping also applies to Aspire proxy endpoints:
+  `--isolated` alone did not randomize the advertised fixed 5039 proxy.
+  Container target ports stay 5432/6379. Reservations are released just
   before agent work; normal startup guards catch a subsequent race.
 - Give Aspire containers and the data volume unique trial-owned names.
+- Select `npm ci` for the TypeScript frontend installer so locked package
+  metadata is not rewritten by the integration's default `npm install`.
 - Use trial-local transparent `dotnet`/`node` executable shims to register PIDs.
   Migration executions tee their real output and record their real exit code
   externally. Raw `.script-state` points to external application logs. No
@@ -161,7 +189,10 @@ installed binary prefix before consulting HOME. The runner therefore copies
 **only the installed executable bytes**, without its installer sidecar or any
 personal configuration, into scratch `ASPIRE_HOME/bin` and uses that executable
 for both CLI and MCP. SDK first-use certificate generation is disabled; no trust
-or global certificate configuration is performed by the harness.
+or global certificate configuration is performed by the harness. OpenSSL creates
+an untrusted, short-lived localhost certificate only under each scratch home,
+with private key/PFX permissions 0600. The same certificate environment is prepared
+for both arms; no personal keychain certificate or credential file is copied.
 
 Current skills are installed with `aspire agent init --skill-locations github`
 and an explicit seven-skill bundle, `--mcp=false`. No personal directories are
@@ -205,6 +236,20 @@ bound to the trial and its exact named data volume may be removed. Cleanup
 failures/orphans stop the batch. No prune, killall, pkill, `aspire stop --all`,
 session-root deletion or broad recursive filesystem removal is used. Temporary
 workspaces and scratch homes remain available for inspection.
+
+Before any verifier HTTP, SignalR or container-exec traffic, the runner proves
+endpoint ownership with actual TCP listener PIDs/start times, exact registered
+processes or fresh unique-workspace/native-Aspire process ancestry, and the
+selected AppHost registry. It rejects every pre-existing listener port/process.
+Containers must be new exact Compose-project resources or match the selected
+Aspire description's IDs and trial-specific names. Pre-trial listener/PID/container
+inventories are read-only attribution evidence, never broad cleanup targets.
+Missing or conflicting proof is infrastructure-unknown and no probe is sent;
+this gate never grades or mutates the user's unrelated workshop at 5039.
+At an agent budget hit, model/tool workers stop but attributed application
+processes are retained for grading. Final teardown waits on kernel process-exit
+notifications (kqueue/pidfd), then escalates only still-live recorded same-start
+PIDs; it never kills by process name.
 
 ## Results and grading
 

@@ -43,7 +43,7 @@ class FixtureTests(unittest.TestCase):
                 after = r.file_manifest(source)
                 changed = {name for name in before if before[name] != after[name]}
                 expected = {"BingoBoard.Admin/Properties/launchSettings.json", "bingo-board/.env.example"}
-                self.assertEqual(changed, expected if variant == "raw" else set())
+                self.assertEqual(changed, expected)
                 compose = (root / "demo/start/compose.yaml").read_text()
                 self.assertIn("allkeys-lfr", compose)
                 self.assertIn("postgres:18", compose)
@@ -58,6 +58,8 @@ class FixtureTests(unittest.TestCase):
                     self.assertIn("ab-test-postgres-data", r.apphost(root, variant).read_text())
                     if variant == "typescript":
                         self.assertIn(".withDataVolume({ name:", r.apphost(root, variant).read_text())
+                        self.assertIn(".withNpm({ installCommand: 'ci' })",
+                                      r.apphost(root, variant).read_text())
                 self.assertTrue(changes)
 
     def test_snapshot_hash_is_reproducible(self):
@@ -209,6 +211,93 @@ class MeasurementTests(unittest.TestCase):
             r.parse_json_output("not json")
 
 
+class OwnershipTests(unittest.TestCase):
+    def test_budget_stops_model_worker_but_preserves_owned_runtime_until_grading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace, home = root / "workspace", root / "home"
+            records = [{"pid": 11, "started": "fresh", "command": "/tools/copilot"},
+                       {"pid": 22, "started": "fresh", "command": str(workspace / "src/BingoBoard.Admin")},
+                       {"pid": 33, "started": "fresh", "command": str(home / ".copilot/sdk/model-worker")}]
+            table = {record["pid"]: record for record in records}
+            process = unittest.mock.Mock(pid=11, returncode=-15)
+            process.wait.side_effect = [subprocess.TimeoutExpired("copilot", 1), None]
+            def owned(pid):
+                return records if pid == 11 else [table[pid]]
+            with patch.object(r, "authentication", return_value="fake-not-used"), patch.object(
+                    r.subprocess, "Popen", return_value=process), patch.object(
+                    r, "process_table", return_value=table), patch.object(
+                    r, "owned_processes", side_effect=owned), patch.object(
+                    r, "registered_processes", return_value=[records[1]]), patch.object(
+                    r, "terminate_recorded", return_value=[]) as terminate:
+                result = r.invoke_agent(["copilot"], workspace, {"HOME": str(home)}, root, 1)
+            self.assertTrue(result["budget_hit"])
+            self.assertEqual([record["pid"] for record in terminate.call_args.args[0]], [11, 33])
+            self.assertEqual(r.read_json(root / "budget-preserved-runtime-processes.json")[0]["pid"], 22)
+
+    def attest(self, root, stale):
+        workspace, output = root / "workspace", root / "results"
+        output.mkdir()
+        host = r.apphost(workspace, "typescript")
+        admin_port = 5039 if stale else 25001
+        metadata = {"run_id": "ab-test", "variant": "typescript", "apphost": str(host),
+                    "admin_url": f"http://localhost:{admin_port}", "frontend_url": "http://localhost:25002",
+                    "postgres": {"container_id": "a" * 64}, "redis": {"container_id": "b" * 64},
+                    "aspire_description": {"resources": [
+                        {"properties": {"container.id": "a" * 64}},
+                        {"properties": {"container.id": "b" * 64}}]}}
+        r.write_json(output / "preexisting-runtime.json", {
+            "listeners": {"5039": [99]}, "processes": {"99": "old-start"}, "container_ids": []})
+        table = {10: {"pid": 10, "started": "fresh", "command": str(root / "home/.aspire/dcp")},
+                 99: {"pid": 99, "started": "old-start", "command": "/foreign/server"}}
+        ps = json.dumps([{"appHostPath": str(host), "appHostPid": 10, "cliPid": 10}])
+        def container(identifier, workspace, env):
+            service = "postgres" if identifier == "a" * 64 else "redis"
+            return {"Id": identifier, "Name": "/ab-test-" + service, "Config": {"Labels": {}}}
+        with patch.object(r, "process_table", return_value=table), patch.object(
+                r, "registered_processes", return_value=[]), patch.object(
+                r, "execute", return_value=subprocess.CompletedProcess([], 0, ps, "")), patch.object(
+                r, "owned_processes", side_effect=lambda pid: [table[pid]]), patch.object(
+                r, "listeners", return_value={admin_port: {99 if stale else 10}, 25002: {10}}), patch.object(
+                r, "docker_inspect", side_effect=container):
+            if stale:
+                with self.assertRaisesRegex(r.BenchError, "refusing all verifier traffic"):
+                    r.attest_ownership(metadata, workspace, {"HOME": str(root / "home")}, output)
+            else:
+                proof = r.attest_ownership(metadata, workspace, {"HOME": str(root / "home")}, output)
+                self.assertTrue(proof["validated"])
+                self.assertEqual(proof["run_id"], "ab-test")
+                self.assertEqual(proof["endpoints"]["admin"]["listener_processes"][0]["pid"], 10)
+        self.assertNotIn(99, [record["pid"] for record in metadata["processes"]])
+
+    def test_exact_fresh_listener_and_container_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.attest(Path(directory), stale=False)
+
+    def test_preexisting_foreign_listener_is_rejected_without_becoming_cleanup_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.attest(Path(directory), stale=True)
+
+    def test_owned_term_ignoring_process_is_killed_with_pid_specific_exit_wait(self):
+        process = subprocess.Popen([sys.executable, "-c",
+                                    "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+                                    "print('READY',flush=True); signal.pause()"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(process.stdout.readline().strip(), "READY")
+            record = r.process_table()[process.pid]
+            wait = r.wait_recorded_exits
+            with patch.object(r, "wait_recorded_exits", side_effect=lambda records, timeout:
+                              wait(records, min(timeout, 0.1))):
+                self.assertEqual(r.terminate_recorded([record]), [])
+            self.assertEqual(process.wait(timeout=2), -9)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            process.stdout.close()
+
+
 class ConfigurationTests(unittest.TestCase):
     def reusable_fixture(self, root, old_code=None):
         config = r.load_config(r.HERE / "configs/primary-pairs.json")
@@ -281,6 +370,7 @@ class ConfigurationTests(unittest.TestCase):
                 argv = ["runner.py", "run", "--config", str(root / "config.json"),
                         "--output", str(root / "results"), "--stop-file", str(stop)]
                 with patch.object(sys, "argv", argv), patch.object(
+                        r, "validate_fixture_gates", return_value=[]), patch.object(
                         r, "run_trial", side_effect=fake_trial) as run, contextlib.redirect_stdout(
                             io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(r.main(), 1)
