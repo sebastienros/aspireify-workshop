@@ -16,6 +16,7 @@
     "dotnet": "10.0.400",
     "node": "v24.4.1",
     "npm": "11.4.2",
-    "docker": "28.0.4 / 28.0.4"
+    "docker": "28.0.4 / 28.0.4",
+    "compose": "Docker Compose version v2.34.0-desktop.1"
   }
 }

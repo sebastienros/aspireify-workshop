@@ -169,21 +169,30 @@ def archive_snapshot(commit: str, workspace: Path, variant: str) -> dict:
 
 def reserve_ports(seed: int) -> tuple[dict, list[socket.socket]]:
     rng = random.Random(seed)
+    occupied = set(listeners())
     mapping, held = {}, []
     try:
         for port in PORTS:
             candidates = list(range(24000, 49000))
             rng.shuffle(candidates)
             for candidate in candidates:
-                sock = socket.socket()
+                if candidate in occupied:
+                    continue
+                sockets = []
                 try:
-                    sock.bind(("127.0.0.1", candidate))
-                    sock.listen()
+                    for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+                        sock = socket.socket(family)
+                        sockets.append(sock)
+                        if family == socket.AF_INET6:
+                            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                        sock.bind((address, candidate))
+                        sock.listen()
                 except OSError:
-                    sock.close()
+                    for sock in sockets:
+                        sock.close()
                     continue
                 mapping[port] = candidate
-                held.append(sock)
+                held.extend(sockets)
                 break
             else:
                 raise BenchError("No free trial ports", "infrastructure_error")
@@ -277,6 +286,13 @@ def isolated_environment(home: Path, workspace: Path, trial_id: str) -> dict:
     # Native script installs prefer their binary's installation prefix over HOME
     # and ASPIRE_HOME. Copy only executable bytes (no installer sidecar/config).
     shutil.copy2(Path(aspire).resolve(), native_bin / "aspire")
+    compose = shutil.which("docker-compose")
+    if not compose:
+        raise BenchError("Installed docker-compose executable is required for isolated plugin discovery")
+    docker_home = home / ".docker"
+    plugins = docker_home / "cli-plugins"
+    plugins.mkdir(parents=True)
+    shutil.copy2(Path(compose).resolve(), plugins / "docker-compose")
     # Executable lookup is retained, not personal config, auth files or parent identity.
     env = {
         "PATH": str(native_bin) + os.pathsep + os.environ["PATH"],
@@ -294,6 +310,7 @@ def isolated_environment(home: Path, workspace: Path, trial_id: str) -> dict:
         "COPILOT_ALLOW_ALL": "true", "COPILOT_AUTO_UPDATE": "false",
         "COPILOT_DISABLE_TERMINAL_TITLE": "1", "NO_COLOR": "1", "CI": "true",
         "CONTAINER_RUNTIME": "docker", "COMPOSE_PROJECT_NAME": trial_id,
+        "DOCKER_CONFIG": str(docker_home),
         "Parameters__admin-password": "agent-bench-local-only",
         "Authentication__AdminPassword": "agent-bench-local-only",
         "ASPIRE_CLI_TELEMETRY_OPTOUT": "true",
@@ -339,6 +356,7 @@ def toolchain(workspace: Path, env: dict, expected: dict) -> dict:
         "aspire": ["aspire", "--version"], "node": ["node", "--version"],
         "npm": ["npm", "--version"], "dotnet": ["dotnet", "--version"],
         "docker": ["docker", "version", "--format", "{{.Client.Version}} / {{.Server.Version}}"],
+        "compose": ["docker", "compose", "version"],
     }
     result = {}
     for name, command in commands.items():
@@ -359,6 +377,8 @@ def toolchain(workspace: Path, env: dict, expected: dict) -> dict:
         result[name] = {"version": version, "version_text": version_text, "executable": str(resolved),
                         "executable_sha256": digest(resolved.read_bytes())}
     result["python"] = {"version": sys.version, "executable": sys.executable}
+    result["compose"]["plugin_sha256"] = digest(
+        (Path(env["DOCKER_CONFIG"]) / "cli-plugins/docker-compose").read_bytes())
     result["platform"] = {"sys_platform": sys.platform, "machine": os.uname().machine}
     result["runtime_selection"] = {
         "selected": "docker", "podman_present": shutil.which("podman") is not None,
@@ -394,7 +414,7 @@ def registered_processes(output: Path, workspace: Path) -> list[dict]:
     for path in (output / "runtime/pids").glob("*.json"):
         record = read_json(path)
         current = table.get(record.get("pid"))
-        if current and current["started"] == record.get("started") and inside(
+        if current and current["started"] == " ".join(record.get("started", "").split()) and inside(
                 Path(record.get("cwd", "/")), workspace):
             result.append(current)
     return result
@@ -629,7 +649,7 @@ def invoke_agent(command: list, workspace: Path, env: dict, output: Path,
                              not re.match(r"(?:/\S*/)?(?:bash|zsh|sh)\s", record["command"])}
             runtime_roots.update(record["pid"] for record in registered_processes(output, workspace)
                                  if "BingoBoard.Admin" in record["command"] or
-                                 "/node_modules/" in record["command"])
+                                 "node_modules/" in record["command"])
             preserved = {record["pid"]: record for root in runtime_roots
                          for record in owned_processes(root) if record["pid"] != process.pid}
             write_json(output / "budget-preserved-runtime-processes.json", list(preserved.values()))
@@ -663,13 +683,50 @@ def read_events(path: Path) -> list[dict]:
 
 
 def merged_events(output: Path, home: Path) -> list[dict]:
-    events = read_events(output / "events.jsonl")
     sessions = sorted((home / ".copilot/session-state").glob("*/events.jsonl"))
     if len(sessions) != 1:
         raise BenchError(f"Expected one isolated session; found {len(sessions)}")
     shutil.copyfile(sessions[0], output / "persisted-events.jsonl")
+    persisted = read_events(sessions[0])
+    by_id = {event["id"]: event for event in persisted if event.get("id")}
+    events, recovered, unavailable = [], [], []
+    lines = (output / "events.jsonl").read_text().splitlines()
+    for number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            # CLI secret redaction can remove JSON string escapes. Never repair
+            # its bytes: require the exact event envelope in the persisted stream.
+            envelope = re.search(r',"id":"([^"]+)","timestamp":"([^"]+)"'
+                                 r'(?:,"parentId":(?:"[^"]*"|null))?}$', line)
+            typ = re.match(r'^\{"type":"([^"]+)"', line)
+            authoritative = by_id.get(envelope[1]) if envelope else None
+            if (typ and typ[1] == "assistant.reasoning" and envelope and
+                    not authoritative and "******" in line):
+                unavailable.append({"line": number, "event_id": envelope[1], "type": typ[1],
+                                    "stdout_line_sha256": digest(line.encode()),
+                                    "reason": "Corrupted optional reasoning-text event; native usage retained"})
+                continue
+            if (not typ or not authoritative or "******" not in line or
+                    authoritative.get("type") != typ[1] or
+                    authoritative.get("timestamp") != envelope[2]):
+                raise BenchError(f"Unrecoverable non-JSON stdout event at line {number}") from exc
+            event = authoritative
+            recovered.append({"line": number, "event_id": event["id"], "type": event["type"],
+                              "parse_error": str(exc), "stdout_line_sha256": digest(line.encode()),
+                              "source": "exact-id/type/timestamp persisted event"})
+        events.append(event)
+    write_json(output / "event-stream-integrity.json", {
+        "stdout_sha256": digest((output / "events.jsonl").read_bytes()),
+        "persisted_sha256": digest(sessions[0].read_bytes()),
+        "stdout_lines": len(lines), "recovered_redacted_events": recovered,
+        "unavailable_optional_events": unavailable,
+        "raw_streams_preserved": True, "json_bytes_rewritten": False,
+    })
     known = {event.get("id") for event in events if event.get("id")}
-    events += [event for event in read_events(sessions[0]) if event.get("id") not in known]
+    events += [event for event in persisted if event.get("id") not in known]
     return sorted(events, key=lambda event: event.get("timestamp", ""))
 
 
@@ -1111,6 +1168,13 @@ def collect_runtime(workspace: Path, env: dict, trial: dict, output: Path,
     known_pids = {item["pid"] for item in metadata["processes"]}
     metadata["processes"].extend(record for record in registered_processes(output, workspace)
                                  if record["pid"] not in known_pids)
+    launch = output / "runtime/raw-launch.json"
+    if launch.exists():
+        record = read_json(launch)
+        current = process_table().get(record["pid"])
+        if current and current["started"] == record["started"]:
+            metadata["processes"] = list({item["pid"]: item for item in
+                                         metadata["processes"] + owned_processes(record["pid"])}.values())
     if trial["variant"] == "raw":
         metadata.update(frontend_url=f"http://localhost:{ports[5173]}",
                         admin_url=f"http://localhost:{ports[5039]}")
@@ -1417,7 +1481,7 @@ def run_trial(config: dict, trial: dict, output: Path, *, calibration: bool) -> 
         if commit != SOURCE:
             raise BenchError("Smoke source pin must be the full bug commit")
         result["snapshot"] = archive_snapshot(commit, workspace, trial["variant"])
-        result["ports"] = ports if trial["variant"] == "raw" else None
+        result["ports"] = ports
         result["transformations"] = transform_fixture(
             workspace, trial["variant"], trial_id, ports, config.get("sdk", "10.0.400"))
         env = isolated_environment(home, workspace, trial_id)
@@ -1590,17 +1654,50 @@ def validate_fixture_gates(paths: list[Path], config: dict) -> list[dict]:
         for field, default in (("sdk", "10.0.400"), ("seed", 0), ("expected_versions", {})):
             if previous.get(field, default) != config.get(field, default):
                 raise BenchError("Fixture gate differs in " + field)
-        gates.append({"path": str(path), "probe": gate.get("probe"),
+        gates.append({"path": str(path), "probe": gate.get("probe"), "variant": gate.get("probe_variant"),
                       "protocol_sha256": gate["protocol_sha256"]})
-    if sorted(gate["probe"] for gate in gates) != ["healthy", "seeded-player-payload"]:
-        raise BenchError("Primary paid pairs require exactly one healthy and one seeded-negative unpaid gate")
+    expected = {(variant, probe) for variant in ("raw", "typescript")
+                for probe in ("healthy", "seeded-player-payload")}
+    if len(gates) != 4 or {(gate["variant"], gate["probe"]) for gate in gates} != expected:
+        raise BenchError("Primary pairs require healthy and seeded-negative unpaid gates for BOTH raw and TypeScript")
     return gates
 
 
-def run_fixture_probe(config: dict, output: Path, *, negative: bool) -> dict:
-    """Unpaid exact-TypeScript lifecycle gate; never touch an agent candidate."""
+def start_raw_background(workspace: Path, env: dict, output: Path) -> dict:
+    process = subprocess.Popen(["bash", "scripts/start.sh"], cwd=workspace / "demo/start",
+                               env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, start_new_session=True)
+    record = process_table().get(process.pid)
+    if not record:
+        raise BenchError("Raw startup exited before its PID could be recorded", "infrastructure_error")
+    write_json(output / "runtime/raw-launch.json", record)
+    deadline = time.monotonic() + 180
+    pending = b""
+    with (output / "raw-start.log").open("wb") as log, selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while time.monotonic() < deadline:
+            if not selector.select(max(0, deadline - time.monotonic())):
+                break
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            log.write(chunk)
+            log.flush()
+            pending += chunk
+            lines = pending.split(b"\n")
+            pending = lines.pop()
+            if any(line.startswith(b"Player: http://localhost:") and b"| Admin:" in line for line in lines):
+                return record
+    raise BenchError("Raw startup never reached its built-in ready marker; see raw-start.log",
+                     "infrastructure_error")
+
+
+def run_fixture_probe(config: dict, output: Path, *, negative: bool,
+                      variant: str = "typescript") -> dict:
+    """Unpaid exact-fixture lifecycle gate; never touch an agent candidate."""
     output.mkdir(parents=True)
-    trial = {"variant": "typescript", "skills": "current", "mcp": True}
+    trial = {"variant": variant, "skills": "current" if variant != "raw" else "none",
+             "mcp": variant != "raw"}
     trial_id = "ab-" + uuid.uuid4().hex[:12]
     root = Path(tempfile.mkdtemp(prefix=trial_id + "-", dir="/tmp")).resolve()
     workspace, home = root / "workspace", root / "home"
@@ -1610,9 +1707,10 @@ def run_fixture_probe(config: dict, output: Path, *, negative: bool) -> dict:
     result = {"probe": "seeded-player-payload" if negative else "healthy",
               "trial_id": trial_id, "workspace": str(workspace),
               "paid_model_calls": 0, "status": "infrastructure_error",
+              "probe_variant": variant,
               "protocol_sha256": protocol_hash(), "verifier_pin": config["verifier"]}
     try:
-        result["snapshot"] = archive_snapshot(HEALTHY, workspace, "typescript")
+        result["snapshot"] = archive_snapshot(HEALTHY, workspace, variant)
         if negative:
             path = "demo/start/src/bingo-board/services/signalrService.js"
             seeded = subprocess.run(["git", "show", SOURCE + ":" + path], cwd=REPO,
@@ -1621,7 +1719,7 @@ def run_fixture_probe(config: dict, output: Path, *, negative: bool) -> dict:
             result["seeded_negative"] = {"path": path, "source_commit": SOURCE,
                                          "sha256": digest(seeded)}
         result["transformations"] = transform_fixture(
-            workspace, "typescript", trial_id, ports, config.get("sdk", "10.0.400"))
+            workspace, variant, trial_id, ports, config.get("sdk", "10.0.400"))
         env = isolated_environment(home, workspace, trial_id)
         result["toolchain"] = toolchain(workspace, env, config.get("expected_versions", {}))
         configure_treatment(workspace, home, env, trial, output, config.get("current_skills", list(SKILLS)))
@@ -1637,27 +1735,32 @@ def run_fixture_probe(config: dict, output: Path, *, negative: bool) -> dict:
         result["prewarm"] = prewarm(workspace, env, trial, output)
         for sock in reservations:
             sock.close()
-        host = apphost(workspace, "typescript")
-        execute(["aspire", "start", "--isolated", "--non-interactive", "--nologo",
-                 "--apphost", str(host)], cwd=workspace, env=env, timeout=180,
-                log=output / "probe-start.log")
-        for resource in ("boardadmin", "bingoboard"):
-            execute(["aspire", "wait", resource, "--apphost", str(host), "--timeout", "120",
-                     "--non-interactive", "--nologo"], cwd=workspace, env=env, timeout=140,
-                    log=output / f"probe-wait-{resource}.log")
+        host = apphost(workspace, variant)
+        if host:
+            execute(["aspire", "start", "--isolated", "--non-interactive", "--nologo",
+                     "--apphost", str(host)], cwd=workspace, env=env, timeout=180,
+                    log=output / "probe-start.log")
+            for resource in ("boardadmin", "bingoboard"):
+                execute(["aspire", "wait", resource, "--apphost", str(host), "--timeout", "120",
+                         "--non-interactive", "--nologo"], cwd=workspace, env=env, timeout=140,
+                        log=output / f"probe-wait-{resource}.log")
+        else:
+            start_raw_background(workspace, env, output)
         runtime = collect_runtime(workspace, env, trial, output, trial_id, ports)
         result["ownership"] = attest_ownership(runtime, workspace, env, output)
         baseline = output / "baseline"
-        archive_snapshot(HEALTHY, baseline, "typescript")
-        transform_fixture(baseline, "typescript", trial_id, ports, config.get("sdk", "10.0.400"))
+        archive_snapshot(HEALTHY, baseline, variant)
+        transform_fixture(baseline, variant, trial_id, ports, config.get("sdk", "10.0.400"))
         write_json(output / "diagnosis.json", {"diagnoses": []})
-        checked = execute([sys.executable, config["verifier"]["path"], "--workspace", str(workspace),
-                           "--variant", "typescript", "--apphost", str(host),
+        argv = [sys.executable, config["verifier"]["path"], "--workspace", str(workspace),
+                           "--variant", variant,
                            "--frontend-url", runtime["frontend_url"], "--admin-url", runtime["admin_url"],
                            "--diagnosis", str(output / "diagnosis.json"), "--baseline", str(baseline),
                            "--runtime-metadata", str(output / "runtime-metadata.json"),
-                           "--output", str(output / "verification.json"), "--container-runtime", "docker"],
-                          cwd=output, timeout=120, check=False, log=output / "verification.log")
+                           "--output", str(output / "verification.json"), "--container-runtime", "docker"]
+        if host:
+            argv.extend(["--apphost", str(host)])
+        checked = execute(argv, cwd=output, timeout=120, check=False, log=output / "verification.log")
         result["verification"] = read_json(output / "verification.json")
         grade = result["verification"]
         basic = all(grade["checks"][key]["status"] == "pass" for key in
@@ -1685,9 +1788,122 @@ def run_fixture_probe(config: dict, output: Path, *, negative: bool) -> dict:
     return result
 
 
+def replay_candidate(config: dict, source_result: Path, output: Path) -> dict:
+    original = read_json(external(source_result))
+    source = Path(original["workspace"])
+    expected = read_json(source_result.parent / "candidate-files.json")
+    if file_manifest(source, ignore=True) != expected:
+        raise BenchError("Original final candidate changed; replay is refused")
+    output.mkdir(parents=True)
+    root = Path(tempfile.mkdtemp(prefix=original["trial_id"] + "-replay-", dir="/tmp")).resolve()
+    workspace, home = root / "workspace", root / "home"
+    workspace.mkdir()
+    for name, checksum in expected.items():
+        path = source / name
+        target = workspace / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        if digest(target.read_bytes()) != checksum:
+            raise BenchError("Candidate copy hash mismatch: " + name)
+    trial = original["trial"]
+    trial_id = original["trial_id"]
+    ports = {int(port): value for port, value in (original.get("ports") or {}).items()}
+    if not ports:
+        prepared = source_result.parent / "baseline/demo/start"
+        script = (prepared / "scripts/start.sh").read_text()
+        profile = read_json(prepared / "src/BingoBoard.Admin/Properties/launchSettings.json")
+        admin = urlsplit(profile["profiles"]["http"]["applicationUrl"]).port
+        postgres = re.search(r"Host=localhost;Port=(\d+)", script)
+        redis = re.search(r'ConnectionStrings__cache="localhost:(\d+)"', script)
+        frontend = {int(port) for port in re.findall(r"http://localhost:(\d+)", script)
+                    if int(port) != admin}
+        if not postgres or not redis or len(frontend) != 1 or not admin:
+            raise BenchError("Original prepared port mapping cannot be proven")
+        ports = {5432: int(postgres[1]), 6379: int(redis[1]), 5039: admin, 5173: frontend.pop()}
+    before_listeners = listeners()
+    if set(ports.values()) & set(before_listeners):
+        raise BenchError("Original candidate's fixed ports are now occupied; no remapping permitted")
+    result = {"status": "infrastructure_error", "post_teardown_replay": True, "paid_model_calls": 0,
+              "source_result": str(source_result), "workspace": str(workspace),
+              "original_agent_wall_ms": original["agent_wall_ms"],
+              "original_usage_path": str(source_result.parent / "usage.json"),
+              "candidate_sha256": manifest_hash(expected), "source_edits": False,
+              "primary_eligibility": False, "verifier_pin": config["verifier"]}
+    env, runtime = None, None
+    try:
+        env = isolated_environment(home, workspace, trial_id)
+        result["toolchain"] = toolchain(workspace, env, config.get("expected_versions", {}))
+        for service in ("postgres", "redis"):
+            if docker_inspect(f"{trial_id}-{service}", workspace, env):
+                raise BenchError("An original trial resource name is occupied; replay refused")
+        volume = f"{trial_id}_bingo-postgres-data" if trial["variant"] == "raw" else f"{trial_id}-postgres-data"
+        if execute(["docker", "volume", "inspect", volume], cwd=workspace, env=env,
+                   check=False).returncode == 0:
+            raise BenchError("Original trial volume still exists; replay requires fresh storage")
+        (output / "fixture-commit.txt").write_text(init_trial_git(workspace, env))
+        install_runtime_capture(home, workspace, env, output)
+        write_json(output / "preexisting-runtime.json", {
+            "listeners": {str(port): sorted(pids) for port, pids in before_listeners.items()},
+            "processes": {str(pid): record["started"] for pid, record in process_table().items()},
+            "container_ids": execute(["docker", "ps", "-aq", "--no-trunc"],
+                                     cwd=workspace, env=env).stdout.split(),
+        })
+        result["prewarm"] = prewarm(workspace, env, trial, output)
+        host = apphost(workspace, trial["variant"])
+        if host:
+            execute(["aspire", "start", "--isolated", "--non-interactive", "--nologo",
+                     "--apphost", str(host)], cwd=workspace, env=env, timeout=180,
+                    log=output / "replay-start.log")
+            for resource in ("boardadmin", "bingoboard"):
+                execute(["aspire", "wait", resource, "--apphost", str(host), "--timeout", "120",
+                         "--non-interactive", "--nologo"], cwd=workspace, env=env, timeout=140,
+                        log=output / f"replay-wait-{resource}.log")
+        else:
+            start_raw_background(workspace, env, output)
+        runtime = collect_runtime(workspace, env, trial, output, trial_id, ports)
+        result["ownership"] = attest_ownership(runtime, workspace, env, output)
+        if file_manifest(workspace, ignore=True) != expected:
+            raise BenchError("Candidate source changed during replay startup; grading refused")
+        baseline = output / "baseline"
+        archive_snapshot(HEALTHY, baseline, trial["variant"])
+        transform_fixture(baseline, trial["variant"], trial_id, ports, config.get("sdk", "10.0.400"))
+        report = source_result.parent / "diagnosis.json"
+        if not report.exists():
+            report = source_result.parent / "stream-recovery/diagnosis.json"
+        shutil.copyfile(report, output / "diagnosis.json")
+        argv = [sys.executable, config["verifier"]["path"], "--workspace", str(workspace),
+                "--variant", trial["variant"], "--frontend-url", runtime["frontend_url"],
+                "--admin-url", runtime["admin_url"], "--diagnosis", str(output / "diagnosis.json"),
+                "--baseline", str(baseline), "--runtime-metadata", str(output / "runtime-metadata.json"),
+                "--output", str(output / "verification.json"), "--container-runtime", "docker"]
+        if host:
+            argv.extend(["--apphost", str(host)])
+        checked = execute(argv, cwd=output, timeout=120, check=False, log=output / "verification.log")
+        result["verification"] = read_json(output / "verification.json")
+        result["status"] = "replay_captured" if checked.returncode in (0, 1) else "infrastructure_error"
+        result["candidate_unchanged_after_verification"] = file_manifest(workspace, ignore=True) == expected
+        if not result["candidate_unchanged_after_verification"]:
+            raise BenchError("Candidate source changed during verification")
+    except (BenchError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        result["status"], result["error"] = "infrastructure_error", str(exc)
+    finally:
+        if env and (workspace / ".git").exists():
+            try:
+                capture_diff(workspace, env, output)
+                runtime = runtime or collect_runtime(workspace, env, trial, output, trial_id, ports)
+                result["teardown_errors"] = teardown(workspace, env, trial, output, runtime)
+            except (BenchError, OSError, ValueError, subprocess.SubprocessError) as exc:
+                result["teardown_errors"] = [str(exc)]
+            if result.get("teardown_errors"):
+                result["status"] = "infrastructure_error"
+        result["original_candidate_still_unchanged"] = file_manifest(source, ignore=True) == expected
+        write_json(output / "result.json", result)
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("plan", "calibrate", "run", "probe"))
+    parser.add_argument("command", choices=("plan", "calibrate", "run", "probe", "replay"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--verifier-commit", help="Export the exact committed grader outside the trial")
@@ -1698,7 +1914,9 @@ def main() -> int:
     parser.add_argument("--seeded-negative", action="store_true",
                         help="For unpaid probe only: healthy fixture with exact seeded player-call file")
     parser.add_argument("--fixture-gate", type=Path, action="append", default=[],
-                        help="Primary run requires two compatible unpaid probe result.json files")
+                        help="Primary run requires four compatible unpaid raw/TypeScript probe result.json files")
+    parser.add_argument("--probe-variant", choices=("raw", "typescript"), default="typescript")
+    parser.add_argument("--candidate-result", type=Path, help="Original result.json for unpaid unchanged-source replay")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
@@ -1713,7 +1931,9 @@ def main() -> int:
             raise BenchError("Use a new empty output directory; results are never overwritten")
         if args.seeded_negative and args.command != "probe":
             raise BenchError("--seeded-negative is only an unpaid fixture probe")
-        if args.command in ("run", "probe"):
+        if args.command == "replay" and not args.candidate_result:
+            raise BenchError("Unpaid replay requires --candidate-result")
+        if args.command in ("run", "probe", "replay"):
             if args.verifier_commit:
                 commit = execute(["git", "rev-parse", "--verify", args.verifier_commit + "^{commit}"],
                                  cwd=REPO).stdout.strip()
@@ -1754,11 +1974,18 @@ def main() -> int:
         output.mkdir(parents=True, exist_ok=True)
         write_json(output / "config.json", config)
         if args.command == "probe":
-            result = run_fixture_probe(config, output / "fixture", negative=args.seeded_negative)
+            result = run_fixture_probe(config, output / "fixture", negative=args.seeded_negative,
+                                       variant=args.probe_variant)
             write_json(output / "results.json", [result])
             print(json.dumps({"probe": result["probe"], "status": result["status"],
                               "error": result.get("error")}))
             return 0 if result["status"] == "fixture_probe_pass" else 1
+        if args.command == "replay":
+            result = replay_candidate(config, args.candidate_result, output / "replay")
+            write_json(output / "results.json", [result])
+            print(json.dumps({"status": result["status"], "post_teardown_replay": True,
+                              "error": result.get("error")}))
+            return 0 if result["status"] == "replay_captured" else 1
         write_json(output / "plan.json", plan)
         write_json(output / "arm-manifest.json", {
             "design": config.get("design", "unpaired-smoke"), "plan": plan,

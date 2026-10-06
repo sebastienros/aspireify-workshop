@@ -24,7 +24,7 @@ selected with a generated trial-local `global.json`, not the default SDK 11 RC.
 From the repository worktree:
 
 ```bash
-# Reproduce both unpaid gates and all eight primary attempts in a fresh directory:
+# Reproduce four unpaid gates and all eight primary attempts in a fresh directory:
 bash eng/agent-bench/run-primary.sh /absolute/external/new-results
 
 python3 -B -m unittest discover -s eng/agent-bench/tests -q
@@ -39,29 +39,39 @@ python3 eng/agent-bench/runner.py calibrate \
   --config eng/agent-bench/configs/skill-capability.json \
   --output /absolute/external/results/skill
 
-# Unpaid gates: exact healthy AppHost, then the healthy fixture with the original
-# seeded player-call file. Both must pass ownership, runtime and cleanup checks.
-python3 eng/agent-bench/runner.py probe \
-  --config eng/agent-bench/configs/primary-pairs.json \
-  --verifier-commit d7b758209fd2deecda5075a1292853f3d569e214 \
-  --output /absolute/external/results/healthy
-python3 eng/agent-bench/runner.py probe --seeded-negative \
-  --config eng/agent-bench/configs/primary-pairs.json \
-  --verifier-commit d7b758209fd2deecda5075a1292853f3d569e214 \
-  --output /absolute/external/results/seeded-negative
+# Unpaid gates: healthy and original seeded player-call fixtures in BOTH arms.
+for variant in raw typescript; do
+  python3 eng/agent-bench/runner.py probe --probe-variant "$variant" \
+    --config eng/agent-bench/configs/primary-pairs.json \
+    --verifier-commit ed64da101b31b89296a44c893ac67d4a0af9dca9 \
+    --output "/absolute/external/results/$variant-healthy"
+  python3 eng/agent-bench/runner.py probe --probe-variant "$variant" --seeded-negative \
+    --config eng/agent-bench/configs/primary-pairs.json \
+    --verifier-commit ed64da101b31b89296a44c893ac67d4a0af9dca9 \
+    --output "/absolute/external/results/$variant-negative"
+done
 
 # Requires a committed verifier and compatible unpaid gates. No PR/matrix opened:
 python3 eng/agent-bench/runner.py run \
   --config eng/agent-bench/configs/primary-pairs.json \
-  --verifier-commit d7b758209fd2deecda5075a1292853f3d569e214 \
-  --fixture-gate /absolute/external/results/healthy/fixture/result.json \
-  --fixture-gate /absolute/external/results/seeded-negative/fixture/result.json \
+  --verifier-commit ed64da101b31b89296a44c893ac67d4a0af9dca9 \
+  --fixture-gate /absolute/external/results/raw-healthy/fixture/result.json \
+  --fixture-gate /absolute/external/results/raw-negative/fixture/result.json \
+  --fixture-gate /absolute/external/results/typescript-healthy/fixture/result.json \
+  --fixture-gate /absolute/external/results/typescript-negative/fixture/result.json \
   --output /absolute/external/results/primary-pairs
 
 # Optional: retain a protocol-compatible already-completed arm without paying again:
 # append --reuse-result /absolute/external/previous/01-model/result.json
 # Optional: append --stop-file /absolute/external/stop-after-current
 # Creating that marker finishes the current trial and cleanup, then stops the batch.
+
+# Unpaid replay of an unchanged captured candidate, with fresh owned storage:
+python3 eng/agent-bench/runner.py replay \
+  --config eng/agent-bench/configs/primary-pairs.json \
+  --verifier-commit ed64da101b31b89296a44c893ac67d4a0af9dca9 \
+  --candidate-result /absolute/external/previous/01-model/result.json \
+  --output /absolute/external/results/replay
 
 # Generate an interleaved full-factorial plan WITHOUT executing it:
 python3 eng/agent-bench/runner.py plan \
@@ -127,13 +137,17 @@ configuration, prompt, source, verifier, recorded execution-function code and to
 shim, valid treatment evidence, native usage, and completed cleanup. Scheduler-only
 changes do not invalidate otherwise identical prior evidence.
 
-Primary paid execution is refused unless both unpaid gate artifacts have the
+Primary paid execution is refused unless all four unpaid gate artifacts have the
 current execution-protocol hash, verifier, SDK/version/seed pins, proven ownership
 and clean teardown. A failed healthy fixture is never charged as an agent repair
 failure. Protocol changes invalidate prior gates and prior-arm reuse; original
 costs/findings remain separate historical evidence. The initial Sol/TypeScript
 result is infrastructure-invalid, not an agent failure: scratch HTTPS setup,
 endpoint attribution and authenticated data-store probing were then incomplete.
+The later Luna pair is also retained as pilot evidence, not reused: raw lacked
+isolated Compose plugin discovery, while the subsequent common SDK fix changes
+tool exposure in both arms. Original agent timings and usage are never replaced
+by unpaid replay timings or mixed into the corrected primary comparison.
 
 `git archive` exports only `demo/start`, the root ignore rules, and exactly one
 selected `demo/checkpoints/03-observe/<language>` for Aspire arms. The raw arm has
@@ -154,7 +168,8 @@ Recorded fixture transformations are deliberately not repairs:
   coupled script, README, environment template, launch profile and Compose host
   mapping. Launch-profile remapping also applies to Aspire proxy endpoints:
   `--isolated` alone did not randomize the advertised fixed 5039 proxy.
-  Container target ports stay 5432/6379. Reservations are released just
+  Both IPv4 and IPv6 loopback sockets are reserved, excluding all previously
+  observed listeners. Container target ports stay 5432/6379. Reservations are released just
   before agent work; normal startup guards catch a subsequent race.
 - Give Aspire containers and the data volume unique trial-owned names.
 - Select `npm ci` for the TypeScript frontend installer so locked package
@@ -193,6 +208,10 @@ or global certificate configuration is performed by the harness. OpenSSL creates
 an untrusted, short-lived localhost certificate only under each scratch home,
 with private key/PFX permissions 0600. The same certificate environment is prepared
 for both arms; no personal keychain certificate or credential file is copied.
+Docker Compose discovery also depends on HOME: only the installed Compose
+executable bytes are copied to scratch `DOCKER_CONFIG/cli-plugins`, with version
+and hash recorded. No personal Docker configuration or credentials are copied.
+The isolated `docker compose version` command must pass before any paid dispatch.
 
 Current skills are installed with `aspire agent init --skill-locations github`
 and an explicit seven-skill bundle, `--mcp=false`. No personal directories are
@@ -249,7 +268,11 @@ this gate never grades or mutates the user's unrelated workshop at 5039.
 At an agent budget hit, model/tool workers stop but attributed application
 processes are retained for grading. Final teardown waits on kernel process-exit
 notifications (kqueue/pidfd), then escalates only still-live recorded same-start
-PIDs; it never kills by process name.
+PIDs; it never kills by process name. Start-time whitespace is normalized in both
+PID capture and comparison, including single-digit calendar days. Unpaid raw
+startup preserves the foreground script's behavior and waits for its built-in
+ready marker with an event selector; it does not mistake a long-lived script for
+a setup timeout.
 
 ## Results and grading
 
@@ -264,6 +287,14 @@ runtime/prewarm versions and transformations, plus TypeScript-minus-raw timing,
 nanoAIU, call/turn and separate native-token-bucket deltas. Incomplete pairs retain
 null deltas rather than fabricating results.
 Actual CLI runtime entry-point hashes supplement executable/version hashes.
+
+Raw event streams are immutable. CLI credential redaction can corrupt JSON
+escaping: malformed core records are recovered only from a valid isolated
+persisted event with the exact same ID, type and timestamp, and only when the
+damaged record contains the redaction marker. `event-stream-integrity.json`
+records hashes, affected lines and authoritative counterparts. Corrupted optional
+reasoning text without a persisted counterpart is explicitly unavailable; native
+usage remains authoritative. Unrecoverable core events invalidate the treatment.
 
 Usage JSON is authoritative. Native input/cache-read/cache-write/output buckets,
 per-model input/output/cache/reasoning values and nanoAIU/API time are retained
@@ -283,3 +314,13 @@ candidate **per root cause**, not one candidate across the whole task. Agent
 claims are never used as runtime evidence. Budget hits, configuration/arm
 failures, authentication/model errors and infrastructure errors are separate
 from unsuccessful repairs. Failures are not silently normalized or repaired.
+Oracle version 4 additionally reports `runtime_workflows_success` and
+`contract_preservation_success` independently; overall repair requires both.
+It permits equivalent provider-backed version handlers/aliases without requiring
+one textual repair, but preserves strict readiness/lifecycle script contracts.
+
+Unpaid replays copy only the captured candidate manifest and verify every byte
+before startup and after verification. They refuse occupied original ports,
+containers or volumes, never remap or edit source, use fresh storage, and retain
+the original timing/usage references. They report `paid_model_calls: 0` and
+`primary_eligibility: false`; post-teardown evidence is not the original timed run.

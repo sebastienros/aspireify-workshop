@@ -89,6 +89,8 @@ class FixtureTests(unittest.TestCase):
                         "BASH_ENV", "OTEL_EXPORTER_OTLP_ENDPOINT", "COPILOT_PROVIDER_API_KEY"):
                 self.assertNotIn(key, env)
             self.assertEqual(env["COMPOSE_PROJECT_NAME"], "ab-test")
+            self.assertEqual(env["DOCKER_CONFIG"], str(Path(directory) / "home/.docker"))
+            self.assertTrue((Path(env["DOCKER_CONFIG"]) / "cli-plugins/docker-compose").is_file())
 
     def test_migration_capture_keeps_true_exit_and_external_logs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -114,6 +116,31 @@ class FixtureTests(unittest.TestCase):
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_redacted_stdout_is_recovered_only_from_exact_persisted_envelope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, home = root / "output", root / "home"
+            output.mkdir()
+            event = {"type": "tool.execution_start", "id": "exact", "timestamp": "2026-10-06T00:00:00Z",
+                     "data": {"arguments": "a harmless local fixture value"}}
+            r.write_json(home / ".copilot/session-state/one/events.jsonl", event)
+            (home / ".copilot/session-state/one/events.jsonl").write_text(json.dumps(event) + "\n")
+            damaged = '{"type":"tool.execution_start","data":{"arguments":"******"broken"},"id":"exact","timestamp":"2026-10-06T00:00:00Z"}'
+            (output / "events.jsonl").write_text(damaged + "\n")
+            self.assertEqual(r.merged_events(output, home), [event])
+            report = r.read_json(output / "event-stream-integrity.json")
+            self.assertEqual(len(report["recovered_redacted_events"]), 1)
+            self.assertFalse(report["json_bytes_rewritten"])
+            (output / "events.jsonl").write_text(damaged.replace('"id":"exact"', '"id":"missing"') + "\n")
+            with self.assertRaisesRegex(r.BenchError, "Unrecoverable"):
+                r.merged_events(output, home)
+            (output / "events.jsonl").write_text(
+                damaged.replace('"tool.execution_start"', '"assistant.reasoning"').replace(
+                    '"id":"exact"', '"id":"optional"') + "\n")
+            self.assertEqual(r.merged_events(output, home), [event])
+            self.assertEqual(len(r.read_json(output / "event-stream-integrity.json")[
+                "unavailable_optional_events"]), 1)
+
     def event(self, typ, data, sec=0):
         return {"type": typ, "data": data, "timestamp": f"2026-10-06T00:00:{sec:02d}Z"}
 
@@ -212,6 +239,51 @@ class MeasurementTests(unittest.TestCase):
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_registered_pid_normalizes_calendar_spacing_without_widening_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            current = {"pid": 12, "started": "Mon Oct 5 12:00:00 2026", "command": "node"}
+            path = root / "runtime/pids/12.json"
+            for started, cwd, valid in (
+                    ("Mon Oct  5 12:00:00 2026", str(workspace), True),
+                    ("Mon Oct  5 12:00:01 2026", str(workspace), False),
+                    ("Mon Oct  5 12:00:00 2026", str(root / "foreign"), False)):
+                r.write_json(path, {"pid": 12, "started": started, "cwd": cwd})
+                with patch.object(r, "process_table", return_value={12: current}):
+                    self.assertEqual(r.registered_processes(root, workspace), [current] if valid else [])
+
+    def test_port_reservations_hold_both_loopback_families_and_avoid_existing_listeners(self):
+        with patch.object(r, "listeners", return_value={24001: {99}}):
+            mapping, held = r.reserve_ports(1)
+        try:
+            self.assertEqual(len(set(mapping.values())), len(r.PORTS))
+            self.assertNotIn(24001, mapping.values())
+            for port in mapping.values():
+                self.assertEqual({sock.family for sock in held if sock.getsockname()[1] == port},
+                                 {r.socket.AF_INET, r.socket.AF_INET6})
+        finally:
+            for sock in held:
+                sock.close()
+
+    def test_raw_foreground_start_waits_for_ready_marker_not_process_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = {"pid": 12, "started": "fresh"}
+            process = unittest.mock.Mock(pid=12)
+            selector = unittest.mock.MagicMock()
+            selector.__enter__.return_value = selector
+            selector.select.return_value = [(process.stdout, r.selectors.EVENT_READ)]
+            with patch.object(r.subprocess, "Popen", return_value=process) as spawn, patch.object(
+                    r, "process_table", return_value={12: record}), patch.object(
+                    r.selectors, "DefaultSelector", return_value=selector), patch.object(
+                    r.os, "read", return_value=b"Starting\nPlayer: http://localhost:25001 | Admin: http://localhost:25002\n"):
+                self.assertEqual(r.start_raw_background(root / "workspace", {}, root), record)
+            self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+            self.assertEqual(spawn.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            process.wait.assert_not_called()
+            self.assertEqual(r.read_json(root / "runtime/raw-launch.json"), record)
+
     def test_budget_stops_model_worker_but_preserves_owned_runtime_until_grading(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -299,6 +371,46 @@ class OwnershipTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_fixture_gates_require_clean_healthy_and_negative_evidence_in_both_arms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {"verifier": {"sha256": "grader"}, "seed": 1}
+            paths = []
+            for variant in ("raw", "typescript"):
+                for probe in ("healthy", "seeded-player-payload"):
+                    path = root / (variant + "-" + probe) / "fixture/result.json"
+                    r.write_json(path, {"status": "fixture_probe_pass", "paid_model_calls": 0,
+                                        "probe": probe, "probe_variant": variant,
+                                        "ownership": {"validated": True}, "teardown_errors": [],
+                                        "protocol_sha256": r.protocol_hash(), "verifier_pin": config["verifier"]})
+                    r.write_json(path.parent.parent / "config.json", config)
+                    paths.append(path)
+            self.assertEqual(len(r.validate_fixture_gates(paths, config)), 4)
+            with self.assertRaisesRegex(r.BenchError, "BOTH raw and TypeScript"):
+                r.validate_fixture_gates(paths[2:], config)
+            gate = r.read_json(paths[0])
+            gate["protocol_sha256"] = "stale"
+            r.write_json(paths[0], gate)
+            with self.assertRaisesRegex(r.BenchError, "different protocol"):
+                r.validate_fixture_gates(paths, config)
+
+    def test_replay_rejects_changed_candidate_before_setup_or_agent_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "source.txt").write_text("captured")
+            source = root / "original/result.json"
+            r.write_json(source, {"workspace": str(workspace)})
+            r.write_json(source.parent / "candidate-files.json", r.file_manifest(workspace, ignore=True))
+            (workspace / "source.txt").write_text("changed")
+            with self.assertRaisesRegex(r.BenchError, "candidate changed"), patch.object(
+                    r, "isolated_environment") as setup, patch.object(r, "invoke_agent") as agent:
+                r.replay_candidate({}, source, root / "replay")
+            setup.assert_not_called()
+            agent.assert_not_called()
+            self.assertFalse((root / "replay").exists())
+
     def reusable_fixture(self, root, old_code=None):
         config = r.load_config(r.HERE / "configs/primary-pairs.json")
         config["verifier"] = {"sha256": "grader"}

@@ -19,8 +19,8 @@ def main():
     executable = os.environ["BENCH_REAL_" + tool.upper()]
     output = Path(os.environ["BENCH_RUNTIME_DIR"])
     args = sys.argv[1:]
-    started = subprocess.run(["ps", "-p", str(os.getpid()), "-o", "lstart="],
-                             capture_output=True, text=True, check=True).stdout.strip()
+    started = " ".join(subprocess.run(["ps", "-p", str(os.getpid()), "-o", "lstart="],
+                                     capture_output=True, text=True, check=True).stdout.split())
     write(output / "pids" / f"{os.getpid()}.json", {
         "pid": os.getpid(), "ppid": os.getppid(), "started": started,
         "tool": tool, "cwd": str(Path.cwd()), "argv": [executable, *args],
